@@ -1,0 +1,140 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: skinkjs — Skink to ECMAScript/JavaScript Transpiler
+//
+// File:    pkg/minify.skink
+// Purpose: Lexical JavaScript/ECMAScript minifier that strips comments and
+//          redundant whitespace while preserving string/template literals and
+//          statement/token boundaries.
+// Author:  Mark Oxley
+// Created: 2026
+
+module minify
+
+import "std/str"
+
+// isIdentChar reports whether byte c can appear inside a JS identifier or number literal.
+fn isIdentChar(c: int) -> bool {
+    if c >= 48 && c <= 57 { return true } // 0-9
+    if c >= 65 && c <= 90 { return true } // A-Z
+    if c >= 97 && c <= 122 { return true } // a-z
+    if c == 95 || c == 36 { return true } // _ or $
+    return false
+}
+
+// isSpaceChar reports whether byte c is horizontal whitespace.
+fn isSpaceChar(c: int) -> bool {
+    return c == 32 || c == 9 || c == 13
+}
+
+// needsSpaceBetween reports whether two adjacent non-whitespace characters
+// require a single space separator to avoid merging tokens (e.g. `return x` or `+ +x`).
+fn needsSpaceBetween(prev: int, next: int) -> bool {
+    if isIdentChar(prev) && isIdentChar(next) {
+        return true
+    }
+    if prev == 43 && next == 43 { // + +
+        return true
+    }
+    if prev == 45 && next == 45 { // - -
+        return true
+    }
+    return false
+}
+
+// MinifyJS compacts JavaScript source code by removing comments, blank lines,
+// indentation, and redundant spaces around operators and punctuation.
+pub fn MinifyJS(src: string) -> string {
+    n := str.Len(src)
+    if n == 0 {
+        return ""
+    }
+
+    sb := str.NewBuilder(n)
+    i := 0
+    lastChar := 0
+
+    for i < n {
+        c := int(src[i])
+
+        // Single-line comment // ...
+        if c == 47 && i + 1 < n && int(src[i + 1]) == 47 {
+            // Preserve //# sourceMappingURL=... directive at end of file
+            if i + 2 < n && int(src[i + 2]) == 35 {
+                if lastChar != 0 && lastChar != 10 {
+                    str.WriteByte(&sb, 10)
+                }
+                for i < n && int(src[i]) != 10 {
+                    str.WriteByte(&sb, int(src[i]))
+                    i = i + 1
+                }
+                str.WriteByte(&sb, 10)
+                lastChar = 10
+                continue
+            }
+            for i < n && int(src[i]) != 10 {
+                i = i + 1
+            }
+            continue
+        }
+
+        // Multi-line comment /* ... */
+        if c == 47 && i + 1 < n && int(src[i + 1]) == 42 {
+            i = i + 2
+            for i + 1 < n {
+                if int(src[i]) == 42 && int(src[i + 1]) == 47 {
+                    i = i + 2
+                    break
+                }
+                i = i + 1
+            }
+            continue
+        }
+
+        // String literal ("..." or '...') or template literal (`...`)
+        if c == 34 || c == 39 || c == 96 {
+            quote := c
+            str.WriteByte(&sb, c)
+            i = i + 1
+            for i < n {
+                sc := int(src[i])
+                str.WriteByte(&sb, sc)
+                if sc == 92 && i + 1 < n { // backslash escape
+                    i = i + 1
+                    str.WriteByte(&sb, int(src[i]))
+                    i = i + 1
+                    continue
+                }
+                i = i + 1
+                if sc == quote {
+                    break
+                }
+            }
+            lastChar = quote
+            continue
+        }
+
+        // Whitespace and newlines
+        if isSpaceChar(c) || c == 10 {
+            for i < n && (isSpaceChar(int(src[i])) || int(src[i]) == 10) {
+                i = i + 1
+            }
+            if i < n && lastChar != 0 {
+                nextChar := int(src[i])
+                if needsSpaceBetween(lastChar, nextChar) {
+                    str.WriteByte(&sb, 32)
+                    lastChar = 32
+                }
+            }
+            continue
+        }
+
+        str.WriteByte(&sb, c)
+        lastChar = c
+        i = i + 1
+    }
+
+    res := str.String(sb)
+    str.Free(&sb)
+    return res
+}

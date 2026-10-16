@@ -1,0 +1,247 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: skinkjs — Skink to ECMAScript/JavaScript Transpiler
+//
+// File:    pkg/sourcemap.skink
+// Purpose: Source Map Revision 3 generator with Base64 VLQ encoding and
+//          inline data URL support for mapping generated JS back to .skink sources.
+// Author:  Mark Oxley
+// Created: 2026
+
+module sourcemap
+
+import "std/str"
+import "std/base64"
+
+// Mapping records a correspondence between a generated JavaScript line/column
+// (0-based) and a source .skink file index, line (0-based), and column (0-based).
+pub struct Mapping {
+    genLine: int // 0-based line in generated JS
+    genCol:  int // 0-based column in generated JS
+    srcIdx:  int // index into SourceMapBuilder.sources
+    srcLine: int // 0-based line in original .skink file
+    srcCol:  int // 0-based column in original .skink file
+}
+
+// SourceMapBuilder accumulates source files and line mappings while emitting JS.
+pub struct SourceMapBuilder {
+    file:           string
+    sources:        []string
+    sourcesContent: []string
+    mappings:       []Mapping
+}
+
+// NewBuilder constructs an empty SourceMapBuilder for the given target JS file name.
+pub fn NewBuilder(file: string) -> SourceMapBuilder {
+    var sources []string
+    var contents []string
+    var mappings []Mapping
+    return SourceMapBuilder{
+        file:           file,
+        sources:        sources,
+        sourcesContent: contents,
+        mappings:       mappings
+    }
+}
+
+// AddSource registers a .skink source file (and its contents) in the builder
+// if not already present, returning its 0-based source index.
+pub fn AddSource(b: *SourceMapBuilder, srcPath: string, content: string) -> int {
+    for i := 0; i < len(b.sources); i = i + 1 {
+        if str.Equal(b.sources[i], srcPath) {
+            return i
+        }
+    }
+    idx := len(b.sources)
+    b.sources = append(b.sources, srcPath)
+    b.sourcesContent = append(b.sourcesContent, content)
+    return idx
+}
+
+// AddMapping records a line/column mapping from generated JS to a .skink source location.
+// Both genLine and srcLine are 1-based at call sites and converted to 0-based per Source Map v3.
+pub fn AddMapping(b: *SourceMapBuilder, genLine1: int, genCol0: int, srcIdx: int, srcLine1: int, srcCol1: int) {
+    if srcIdx < 0 {
+        return
+    }
+    gl := genLine1 - 1
+    if gl < 0 { gl = 0 }
+    gc := genCol0
+    if gc < 0 { gc = 0 }
+    sl := srcLine1 - 1
+    if sl < 0 { sl = 0 }
+    sc := srcCol1 - 1
+    if sc < 0 { sc = 0 }
+    m := Mapping{
+        genLine: gl,
+        genCol:  gc,
+        srcIdx:  srcIdx,
+        srcLine: sl,
+        srcCol:  sc
+    }
+    b.mappings = append(b.mappings, m)
+}
+
+// base64Char returns the Base64 alphabet character for a 6-bit value (0..63).
+fn base64Char(digit: int) -> string {
+    alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    if digit < 0 || digit >= 64 {
+        return "A"
+    }
+    return str.Substr(alphabet, digit, 1)
+}
+
+// EncodeVLQ encodes a signed integer into a Base64 VLQ string per the Source Map v3 spec.
+pub fn EncodeVLQ(value: int) -> string {
+    vlq := 0
+    if value < 0 {
+        vlq = ((-value) << 1) + 1
+    } else {
+        vlq = value << 1
+    }
+    res := ""
+    for {
+        digit := vlq & 31
+        vlq = vlq >> 5
+        if vlq > 0 {
+            digit = digit | 32
+        }
+        res = str.Concat(res, base64Char(digit))
+        if vlq <= 0 {
+            break
+        }
+    }
+    return res
+}
+
+// escapeJSONString escapes a string for inclusion in JSON output.
+fn escapeJSONString(s: string) -> string {
+    sb := str.NewBuilder(str.Len(s) + 16)
+    str.Write(&sb, "\"")
+    n := str.Len(s)
+    for i := 0; i < n; i = i + 1 {
+        c := int(s[i])
+        if c == 34 {
+            str.Write(&sb, "\\\"")
+        } else if c == 92 {
+            str.Write(&sb, "\\\\")
+        } else if c == 10 {
+            str.Write(&sb, "\\n")
+        } else if c == 13 {
+            str.Write(&sb, "\\r")
+        } else if c == 9 {
+            str.Write(&sb, "\\t")
+        } else if c == 8 {
+            str.Write(&sb, "\\b")
+        } else if c == 12 {
+            str.Write(&sb, "\\f")
+        } else {
+            str.WriteByte(&sb, c)
+        }
+    }
+    str.Write(&sb, "\"")
+    out := str.String(sb)
+    str.Free(&sb)
+    return out
+}
+
+// BuildMappingsString encodes all recorded mappings into the semicolon/comma-separated
+// VLQ mappings string defined by Source Map v3.
+pub fn BuildMappingsString(b: SourceMapBuilder, totalGenLines: int) -> string {
+    maxLine := totalGenLines
+    for i := 0; i < len(b.mappings); i = i + 1 {
+        if b.mappings[i].genLine + 1 > maxLine {
+            maxLine = b.mappings[i].genLine + 1
+        }
+    }
+    if maxLine < 1 {
+        maxLine = 1
+    }
+
+    sb := str.NewBuilder(256)
+    prevSrcIdx := 0
+    prevSrcLine := 0
+    prevSrcCol := 0
+    mapIdx := 0
+    numMappings := len(b.mappings)
+
+    for line := 0; line < maxLine; line = line + 1 {
+        if line > 0 {
+            str.Write(&sb, ";")
+        }
+        prevGenCol := 0
+        segCount := 0
+        for mapIdx < numMappings && b.mappings[mapIdx].genLine == line {
+            m := b.mappings[mapIdx]
+            if segCount > 0 {
+                str.Write(&sb, ",")
+            }
+            seg := str.Concat(
+                EncodeVLQ(m.genCol - prevGenCol),
+                str.Concat(
+                    EncodeVLQ(m.srcIdx - prevSrcIdx),
+                    str.Concat(
+                        EncodeVLQ(m.srcLine - prevSrcLine),
+                        EncodeVLQ(m.srcCol - prevSrcCol)
+                    )
+                )
+            )
+            str.Write(&sb, seg)
+            prevGenCol = m.genCol
+            prevSrcIdx = m.srcIdx
+            prevSrcLine = m.srcLine
+            prevSrcCol = m.srcCol
+            segCount = segCount + 1
+            mapIdx = mapIdx + 1
+        }
+    }
+
+    res := str.String(sb)
+    str.Free(&sb)
+    return res
+}
+
+// BuildJSON serializes the SourceMapBuilder into a Source Map Revision 3 JSON document.
+pub fn BuildJSON(b: SourceMapBuilder, totalGenLines: int, includeSourcesContent: bool) -> string {
+    sb := str.NewBuilder(1024)
+    str.Write(&sb, "{\n")
+    str.Write(&sb, "  \"version\": 3,\n")
+    str.Write(&sb, str.Concat("  \"file\": ", str.Concat(escapeJSONString(b.file), ",\n")))
+
+    // sources array
+    str.Write(&sb, "  \"sources\": [")
+    for i := 0; i < len(b.sources); i = i + 1 {
+        if i > 0 {
+            str.Write(&sb, ", ")
+        }
+        str.Write(&sb, escapeJSONString(b.sources[i]))
+    }
+    str.Write(&sb, "],\n")
+
+    // sourcesContent array (optional)
+    if includeSourcesContent {
+        str.Write(&sb, "  \"sourcesContent\": [")
+        for i := 0; i < len(b.sourcesContent); i = i + 1 {
+            if i > 0 {
+                str.Write(&sb, ", ")
+            }
+            str.Write(&sb, escapeJSONString(b.sourcesContent[i]))
+        }
+        str.Write(&sb, "],\n")
+    }
+
+    str.Write(&sb, "  \"names\": [],\n")
+    mappingsStr := BuildMappingsString(b, totalGenLines)
+    str.Write(&sb, str.Concat("  \"mappings\": ", str.Concat(escapeJSONString(mappingsStr), "\n")))
+    str.Write(&sb, "}\n")
+
+    res := str.String(sb)
+    str.Free(&sb)
+    return res
+}
+
+// BuildInlineComment encodes a Source Map v3 JSON string as an inline Base64 sourceMappingURL comment.
+pub fn BuildInlineComment(mapJSON: string) -> string {
+    encoded := base64.Encode(mapJSON, str.Len(mapJSON))
+    return str.Concat("//# sourceMappingURL=data:application/json;charset=utf-8;base64,", encoded)
+}

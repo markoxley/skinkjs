@@ -1,0 +1,194 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: skinkjs — Skink to ECMAScript/JavaScript Transpiler
+//
+// File:    skinkjs.skink
+// Purpose: CLI entry point for the skinkjs transpiler; loads JSON configuration
+//          (skinkjs.json), applies CLI flag overrides, resolves and type-checks
+//          Skink source programs, and emits single-file or multi-file JavaScript
+//          (ESM, CJS, IIFE, UMD, script) with optional minification and Source Map v3.
+// Author:  Mark Oxley
+// Created: 2026
+
+module main
+
+import "std/os"
+import "std/fs"
+import "std/str"
+import "std/path"
+import "version"
+import "pkg/config"
+import "pkg/transpiler"
+
+// printUsage prints the command-line help for skinkjs.
+fn printUsage() {
+    println("skinkjs — Skink to ECMAScript/JavaScript Transpiler")
+    println("")
+    println("Usage:")
+    println("  skinkjs [options] [entry.skink]")
+    println("  skinkjs init                       Create a default skinkjs.json configuration file")
+    println("")
+    println("Options:")
+    println("  -c, --config <file>                Load JSON configuration from <file> (default: ./skinkjs.json if present)")
+    println("  -i, --entry <file.skink>           Input Skink entry source file")
+    println("  -f, --format <fmt>                 Output module format: esm, cjs, iife, umd, script (default: esm)")
+    println("  -t, --target <ver>                 ECMAScript target: es2015, es2020, es2022, esnext (default: es2022)")
+    println("      --env <env>                    Target JS environment: universal, node, browser (default: universal)")
+    println("  -o, --out-file <file.js>           Output file name (use '-' for stdout)")
+    println("  -d, --out-dir <dir>                Output directory for generated files")
+    println("  -b, --bundle, --single-file        Emit a single self-contained JS file (default)")
+    println("  -M, --multi-file, --no-bundle      Emit separate JS files per resolved module in outDir")
+    println("  -m, --minify                       Minify generated JavaScript")
+    println("      --no-minify                    Disable minification")
+    println("  -s, --sourcemap                    Generate Source Map v3 (.js.map) files")
+    println("      --inline-sourcemap             Embed Source Map v3 inline as a base64 data URL")
+    println("      --no-sourcemap                 Disable source map generation")
+    println("      --sources-content              Include original .skink source text in source maps (default)")
+    println("      --no-sources-content           Omit sourcesContent from source maps")
+    println("  -g, --global-name <name>           Global namespace variable for iife/umd formats (default: SkinkApp)")
+    println("      --run-main / --no-run-main     Automatically invoke main() at bundle startup (default: true)")
+    println("      --runtime / --no-runtime       Include the __skink runtime prelude (default: true)")
+    println("      --strict / --no-strict         Emit \"use strict\" directive (default: true)")
+    println("      --comments / --no-comments     Preserve declaration comments in non-minified output")
+    println("      --typecheck / --no-typecheck   Run the Skink type checker before transpiling (default: true)")
+    println("      --stdout, --print              Print transpiled JavaScript to stdout instead of writing files")
+    println("  -v, --version                      Print the skinkjs version")
+    println("  -h, --help                         Show this help message")
+}
+
+// ensureParentDir creates any parent directories required before writing filePath.
+fn ensureParentDir(filePath: string) {
+    dir := path.Dir(filePath)
+    if str.Len(dir) == 0 || str.Equal(dir, ".") || str.Equal(dir, "/") {
+        return
+    }
+    parts := str.Split(dir, "/")
+    cur := ""
+    if str.StartsWith(dir, "/") {
+        cur = "/"
+    }
+    for i := 0; i < len(parts); i = i + 1 {
+        seg := parts[i]
+        if str.Len(seg) == 0 || str.Equal(seg, ".") {
+            continue
+        }
+        if str.Len(cur) == 0 {
+            cur = seg
+        } else if str.Equal(cur, "/") {
+            cur = str.Concat("/", seg)
+        } else {
+            cur = str.Concat(cur, str.Concat("/", seg))
+        }
+        if !fs.Exists(cur) {
+            fs.Mkdir(cur)
+        }
+    }
+}
+
+// resolveSkinkHome determines the standard library directory from SKINK_HOME or
+// common installation paths.
+fn resolveSkinkHome() -> string {
+    envHome := os.Getenv("SKINK_HOME")
+    if int64(envHome) != 0 && str.Len(envHome) > 0 {
+        return envHome
+    }
+    home := os.Getenv("HOME")
+    if int64(home) != 0 && str.Len(home) > 0 {
+        localStd := str.Concat(home, "/.local/skink/std")
+        if fs.Exists(str.Concat(localStd, "/str.skink")) {
+            return localStd
+        }
+    }
+    if fs.Exists("../skink/std/str.skink") {
+        return "../skink/std"
+    }
+    return "/usr/local/lib/skink"
+}
+
+// main is the CLI entry point for skinkjs.
+fn main() -> int {
+    rawArgs := os.Args()
+    var cliArgs []string
+    for i := 1; i < len(rawArgs); i = i + 1 {
+        cliArgs = append(cliArgs, rawArgs[i])
+    }
+
+    cwd := os.Getwd()
+    if str.Len(cwd) == 0 {
+        cwd = "."
+    }
+
+    cfg, err := config.LoadAndMerge(cliArgs, cwd)
+    if err.message != "" {
+        println(str.Concat("error: ", err.message))
+        return 1
+    }
+
+    if cfg.showVersion {
+        println(str.Concat("skinkjs ", version.Version))
+        return 0
+    }
+
+    if cfg.showHelp {
+        printUsage()
+        return 0
+    }
+
+    if cfg.initConfig {
+        targetCfg := "skinkjs.json"
+        if fs.Exists(targetCfg) {
+            println("error: skinkjs.json already exists in this directory")
+            return 1
+        }
+        jsonText := config.DefaultConfigJSON(cfg)
+        wErr := fs.WriteAll(targetCfg, jsonText)
+        if wErr.message != "" {
+            println(str.Concat("error writing skinkjs.json: ", wErr.message))
+            return 1
+        }
+        println("Initialized skinkjs.json")
+        return 0
+    }
+
+    if str.Len(cfg.entry) == 0 {
+        printUsage()
+        return 1
+    }
+
+    skinkHome := resolveSkinkHome()
+    result, errs := transpiler.TranspileProgram(cfg, skinkHome)
+    if len(errs) > 0 {
+        for i := 0; i < len(errs); i = i + 1 {
+            println(errs[i])
+        }
+        return 1
+    }
+
+    if cfg.emitStdout {
+        for i := 0; i < len(result.units); i = i + 1 {
+            print(result.units[i].jsCode)
+        }
+        return 0
+    }
+
+    for i := 0; i < len(result.units); i = i + 1 {
+        u := result.units[i]
+        ensureParentDir(u.filePath)
+        wErr := fs.WriteAll(u.filePath, u.jsCode)
+        if wErr.message != "" {
+            println(str.Concat("error writing ", str.Concat(u.filePath, str.Concat(": ", wErr.message))))
+            return 1
+        }
+        if str.Len(u.sourceMapPath) > 0 && str.Len(u.sourceMapJSON) > 0 {
+            ensureParentDir(u.sourceMapPath)
+            mErr := fs.WriteAll(u.sourceMapPath, u.sourceMapJSON)
+            if mErr.message != "" {
+                println(str.Concat("error writing ", str.Concat(u.sourceMapPath, str.Concat(": ", mErr.message))))
+                return 1
+            }
+        }
+        println(str.Concat("transpiled ", u.filePath))
+    }
+
+    return 0
+}

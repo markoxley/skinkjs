@@ -1,0 +1,554 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: skinkjs — Skink to ECMAScript/JavaScript Transpiler
+//
+// File:    skinkjs_test.skink
+// Purpose: Unit and end-to-end integration test suite for skinkjs covering
+//          JSON config parsing, CLI overrides, VLQ source map generation,
+//          JS minification, all output formats (ESM, CJS, IIFE, UMD, script),
+//          single-file and multi-file output, and Node.js execution across
+//          Skink language features.
+// Author:  Mark Oxley
+// Created: 2026
+
+module skinkjs_test
+
+import "std/testing"
+import "std/str"
+import "std/fs"
+import "std/os"
+import "std/json"
+import "pkg/config"
+import "pkg/sourcemap"
+import "pkg/minify"
+import "pkg/transpiler"
+
+// resolveTestSkinkHome returns the stdlib directory for test invocations.
+fn resolveTestSkinkHome() -> string {
+    envHome := os.Getenv("SKINK_HOME")
+    if int64(envHome) != 0 && str.Len(envHome) > 0 {
+        return envHome
+    }
+    if fs.Exists("../skink/std/str.skink") {
+        return "../skink/std"
+    }
+    home := os.Getenv("HOME")
+    return str.Concat(home, "/.local/skink/std")
+}
+
+// TestConfigJSONAndCLIOverrides verifies that JSON configuration options are parsed
+// accurately and that CLI parameters override JSON values as required by desc.md.
+pub fn TestConfigJSONAndCLIOverrides() {
+    cfg := config.DefaultConfig()
+    jsonSrc := `{
+        "entry": "src/app.skink",
+        "format": "esm",
+        "target": "es2020",
+        "env": "browser",
+        "outFile": "bundle.js",
+        "outDir": "build",
+        "bundle": true,
+        "minify": false,
+        "sourceMap": true,
+        "globalName": "AppGlobal",
+        "autoRunMain": false
+    }`
+    err := config.ApplyJSONString(&cfg, jsonSrc)
+    testing.AssertEqualString("", err.message, "ApplyJSONString should succeed")
+    testing.AssertEqualString("src/app.skink", cfg.entry, "entry from JSON")
+    testing.AssertEqualString("esm", cfg.format, "format from JSON")
+    testing.AssertEqualString("es2020", cfg.target, "target from JSON")
+    testing.AssertEqualString("browser", cfg.env, "env from JSON")
+    testing.AssertEqualString("bundle.js", cfg.outFile, "outFile from JSON")
+    testing.AssertEqualString("build", cfg.outDir, "outDir from JSON")
+    testing.AssertTrue(cfg.bundle, "bundle true from JSON")
+    testing.AssertFalse(cfg.minify, "minify false from JSON")
+    testing.AssertTrue(cfg.sourceMap, "sourceMap true from JSON")
+    testing.AssertEqualString("AppGlobal", cfg.globalName, "globalName from JSON")
+    testing.AssertFalse(cfg.autoRunMain, "autoRunMain false from JSON")
+
+    // Override via CLI parameters
+    cliArgs := []string{
+        "--format", "cjs",
+        "--out-dir", "dist/out",
+        "--out-file", "override.cjs",
+        "--minify",
+        "--no-sourcemap",
+        "--multi-file",
+        "--run-main",
+        "cli_entry.skink"
+    }
+    cErr := config.ParseCLIOverrides(&cfg, cliArgs)
+    testing.AssertEqualString("", cErr.message, "ParseCLIOverrides should succeed")
+    testing.AssertEqualString("cjs", cfg.format, "CLI overrides format to cjs")
+    testing.AssertEqualString("dist/out", cfg.outDir, "CLI overrides outDir")
+    testing.AssertEqualString("override.cjs", cfg.outFile, "CLI overrides outFile")
+    testing.AssertTrue(cfg.minify, "CLI enables minify")
+    testing.AssertFalse(cfg.sourceMap, "CLI disables sourceMap")
+    testing.AssertFalse(cfg.bundle, "CLI switches to multi-file mode")
+    testing.AssertTrue(cfg.autoRunMain, "CLI enables autoRunMain")
+    testing.AssertEqualString("cli_entry.skink", cfg.entry, "CLI overrides entry file")
+}
+
+// TestSourceMapVLQAndJSON verifies Base64 VLQ encoding and Source Map v3 JSON generation.
+pub fn TestSourceMapVLQAndJSON() {
+    testing.AssertEqualString("A", sourcemap.EncodeVLQ(0), "VLQ(0) == A")
+    testing.AssertEqualString("C", sourcemap.EncodeVLQ(1), "VLQ(1) == C")
+    testing.AssertEqualString("D", sourcemap.EncodeVLQ(-1), "VLQ(-1) == D")
+    testing.AssertEqualString("gB", sourcemap.EncodeVLQ(16), "VLQ(16) == gB")
+
+    b := sourcemap.NewBuilder("app.js")
+    idx := sourcemap.AddSource(&b, "main.skink", "module main\nfn main() {}\n")
+    testing.AssertEqualInt(0, idx, "first source index is 0")
+    sourcemap.AddMapping(&b, 1, 0, idx, 1, 1)
+    sourcemap.AddMapping(&b, 2, 2, idx, 2, 1)
+
+    smJSON := sourcemap.BuildJSON(b, 3, true)
+    parsed, err := json.Unmarshal(smJSON)
+    testing.AssertEqualString("", err.message, "SourceMap JSON must be valid JSON")
+    testing.AssertEqualInt(3, json.GetInt(parsed, "version"), "SourceMap version == 3")
+    testing.AssertEqualString("app.js", json.GetString(parsed, "file"), "SourceMap file == app.js")
+    testing.AssertTrue(str.Len(json.GetString(parsed, "mappings")) > 0, "SourceMap mappings non-empty")
+
+    inline := sourcemap.BuildInlineComment(smJSON)
+    testing.AssertTrue(str.StartsWith(inline, "//# sourceMappingURL=data:application/json;charset=utf-8;base64,"), "inline source map comment prefix")
+}
+
+// TestMinifyJS verifies comment stripping, whitespace compaction, and string literal preservation.
+pub fn TestMinifyJS() {
+    raw := "// header comment\nfunction add(a, b) {\n  /* block comment */\n  const msg = \"hello /* not a comment */ // world\";\n  return a + b;\n}\n//# sourceMappingURL=app.js.map\n"
+    minified := minify.MinifyJS(raw)
+    testing.AssertFalse(str.Contains(minified, "header comment"), "line comment removed")
+    testing.AssertFalse(str.Contains(minified, "block comment"), "block comment removed")
+    testing.AssertTrue(str.Contains(minified, "\"hello /* not a comment */ // world\""), "string literal preserved intact")
+    testing.AssertTrue(str.Contains(minified, "function add(a,b){const msg="), "whitespace compacted around tokens")
+    testing.AssertTrue(str.Contains(minified, "return a+b;"), "keyword space preserved before identifier")
+    testing.AssertTrue(str.Contains(minified, "//# sourceMappingURL=app.js.map"), "sourceMappingURL comment preserved")
+}
+
+// TestTranspileCoreFeaturesAndRunNode transpiles a comprehensive Skink program using
+// structs, methods, pointers, slices, maps, sets, enums, tagged unions, match,
+// closures, tuples, error propagation (?), defer/recover, rulesets, services,
+// string interpolation, and stdlib modules, then executes it with Node.js.
+pub fn TestTranspileCoreFeaturesAndRunNode() {
+    tmpDir := "/tmp/skinkjs_test_core"
+    os.System(str.Concat("rm -rf ", str.Concat(tmpDir, str.Concat(" && mkdir -p ", tmpDir))))
+
+    srcFile := str.Concat(tmpDir, "/features.skink")
+    srcCode := `module main
+
+import "std/str"
+import "std/math"
+import "std/strconv"
+import "std/errors"
+
+pub struct Counter {
+    val: int
+    pub fn Add(self: *Counter, delta: int) -> int {
+        self.val = self.val + delta
+        return self.val
+    }
+}
+
+pub enum Shape {
+    Circle(int)
+    Rect(int, int)
+}
+
+var currentTemp: int = 25
+
+ruleset TempMonitor {
+    rule low when currentTemp < 50 {
+        action: { println("rule:low") }
+        priority: 10
+    }
+    rule high when currentTemp > 10 {
+        action: { println("rule:high") }
+        priority: 100
+    }
+}
+
+fn square(x: int) -> int {
+    return x * x
+}
+
+fn divide(a: int, b: int) -> (int, errors.Error) {
+    if b == 0 {
+        return 0, errors.New("div0")
+    }
+    return a / b, errors.None()
+}
+
+fn compute(a: int, b: int) -> (int, errors.Error) {
+    q := divide(a, b)?
+    return q * 2, errors.None()
+}
+
+fn bumpPtr(p: *int) {
+    *p = *p + 5
+}
+
+fn describeShape(s: Shape) -> string {
+    return match s {
+        Circle(r) => "circle:" + strconv.Itoa(r)
+        Rect(w, h) => "rect:" + strconv.Itoa(w * h)
+        _ => "unknown"
+    }
+}
+
+fn withDefer() -> string {
+    defer println("deferred:1")
+    defer println("deferred:2")
+    println("body:run")
+    return "done"
+}
+
+fn main() {
+    c := Counter{val: 10}
+    println("counter:", c.Add(7))
+
+    n := 20
+    bumpPtr(&n)
+    println("ptr:", n)
+
+    println("intdiv:", 7 / 2)
+    println("shape1:", describeShape(Circle(9)))
+    println("shape2:", describeShape(Rect(3, 4)))
+
+    resOk, err1 := compute(20, 4)
+    println("compute_ok:", resOk, err1.message)
+    _, err2 := compute(20, 0)
+    println("compute_err:", err2.message)
+
+    arr := []int{10, 20, 30, 40}
+    println("from_end:", arr[^1], "len:", len(arr))
+
+    m := make(map[string]int)
+    m["alpha"] = 1
+    m["beta"] = 2
+    println("map:", m["alpha"] + m["beta"], len(m))
+
+    st := set{1, 2, 3}
+    println("set:", 2 in st, len(st))
+
+    ch := make(chan<int>, 2)
+    ch <- 99
+    rx := <-ch
+    println("chan:", rx)
+
+    fut := async square(5)
+    fVal := await fut
+    println("async:", fVal)
+
+    TempMonitor.start()
+    TempMonitor.stop()
+    _ = withDefer()
+    println("upper:", str.ToUpper("skinkjs"), "sqrt:", int(math.Sqrt(81.0)))
+}
+`
+    wErr := fs.WriteAll(srcFile, srcCode)
+    testing.AssertEqualString("", wErr.message, "write features.skink")
+
+    cfg := config.DefaultConfig()
+    cfg.entry = srcFile
+    cfg.format = "cjs"
+    cfg.outDir = tmpDir
+    cfg.outFile = "features.cjs"
+    cfg.sourceMap = true
+
+    res, errs := transpiler.TranspileProgram(cfg, resolveTestSkinkHome())
+    if len(errs) > 0 {
+        for i := 0; i < len(errs); i = i + 1 {
+            println("transpile err:", errs[i])
+        }
+        testing.Errorf("TranspileProgram returned errors")
+        return
+    }
+    testing.AssertEqualInt(1, len(res.units), "single-file bundle produces 1 OutputUnit")
+
+    outJSPath := str.Concat(tmpDir, "/features.cjs")
+    fs.WriteAll(outJSPath, res.units[0].jsCode)
+    fs.WriteAll(res.units[0].sourceMapPath, res.units[0].sourceMapJSON)
+
+    nodeOut, status := os.RunWithOutput(str.Concat("node ", outJSPath))
+    testing.AssertEqualInt(0, status, "node execution of features.cjs must exit 0")
+    testing.AssertTrue(str.Contains(nodeOut, "counter:17"), "struct method mutation output")
+    testing.AssertTrue(str.Contains(nodeOut, "ptr:25"), "pointer address-of & dereference output")
+    testing.AssertTrue(str.Contains(nodeOut, "intdiv:3"), "integer division truncation output")
+    testing.AssertTrue(str.Contains(nodeOut, "shape1:circle:9"), "tagged union Circle match")
+    testing.AssertTrue(str.Contains(nodeOut, "shape2:rect:12"), "tagged union Rect match")
+    testing.AssertTrue(str.Contains(nodeOut, "compute_ok:10"), "? error propagation success path")
+    testing.AssertTrue(str.Contains(nodeOut, "compute_err:div0"), "? error propagation early-return path")
+    testing.AssertTrue(str.Contains(nodeOut, "from_end:40len:4"), "from-end indexing [^1] and len()")
+    testing.AssertTrue(str.Contains(nodeOut, "map:32"), "map indexing and len()")
+    testing.AssertTrue(str.Contains(nodeOut, "set:true3"), "set literal and in operator")
+    testing.AssertTrue(str.Contains(nodeOut, "chan:99"), "channel send and receive")
+    testing.AssertTrue(str.Contains(nodeOut, "async:25"), "async/await future evaluation")
+    testing.AssertTrue(str.Contains(nodeOut, "rule:high\nrule:low"), "ruleset priority ordering")
+    testing.AssertTrue(str.Contains(nodeOut, "body:run\ndeferred:2\ndeferred:1"), "LIFO defer execution order")
+    testing.AssertTrue(str.Contains(nodeOut, "upper:SKINKJSsqrt:9"), "std/str and std/math shims")
+
+    os.System(str.Concat("rm -rf ", tmpDir))
+}
+
+// TestOutputFormatsAndMultiFile verifies ESM, CJS, IIFE, UMD, minification, and
+// multi-file module output both structurally and via Node.js execution.
+pub fn TestOutputFormatsAndMultiFile() {
+    tmpDir := "/tmp/skinkjs_test_formats"
+    os.System(str.Concat("rm -rf ", str.Concat(tmpDir, str.Concat(" && mkdir -p ", tmpDir))))
+
+    mathMod := str.Concat(tmpDir, "/calc.skink")
+    fs.WriteAll(mathMod, "module calc\n\npub fn Triple(x: int) -> int {\n    return x * 3\n}\n")
+
+    mainMod := str.Concat(tmpDir, "/main.skink")
+    fs.WriteAll(mainMod, "module main\n\nimport \"calc\"\n\npub fn Compute() -> int {\n    return calc.Triple(14)\n}\n\nfn main() {\n    println(\"result:\", Compute())\n}\n")
+
+    skinkHome := resolveTestSkinkHome()
+
+    // 1. IIFE + Minified
+    cfgIIFE := config.DefaultConfig()
+    cfgIIFE.entry = mainMod
+    cfgIIFE.format = "iife"
+    cfgIIFE.globalName = "MyCalcBundle"
+    cfgIIFE.minify = true
+    cfgIIFE.outDir = tmpDir
+    cfgIIFE.outFile = "bundle.iife.js"
+    resIIFE, errsIIFE := transpiler.TranspileProgram(cfgIIFE, skinkHome)
+    testing.AssertEqualInt(0, len(errsIIFE), "IIFE transpile errors == 0")
+    iifePath := resIIFE.units[0].filePath
+    fs.WriteAll(iifePath, resIIFE.units[0].jsCode)
+    testing.AssertTrue(str.Contains(resIIFE.units[0].jsCode, "MyCalcBundle"), "IIFE contains globalName")
+    outIIFE, rcIIFE := os.RunWithOutput(str.Concat("node ", iifePath))
+    testing.AssertEqualInt(0, rcIIFE, "IIFE runs in node")
+    testing.AssertTrue(str.Contains(outIIFE, "result:42"), "IIFE output is result:42")
+
+    // 2. Multi-file CJS output
+    multiDir := str.Concat(tmpDir, "/multi_cjs")
+    os.System(str.Concat("mkdir -p ", multiDir))
+    cfgMulti := config.DefaultConfig()
+    cfgMulti.entry = mainMod
+    cfgMulti.format = "cjs"
+    cfgMulti.bundle = false
+    cfgMulti.outDir = multiDir
+    resMulti, errsMulti := transpiler.TranspileProgram(cfgMulti, skinkHome)
+    testing.AssertEqualInt(0, len(errsMulti), "Multi-file CJS transpile errors == 0")
+    testing.AssertEqualInt(3, len(resMulti.units), "Multi-file emits _skink_runtime.js, calc.js, and main.js")
+    for i := 0; i < len(resMulti.units); i = i + 1 {
+        u := resMulti.units[i]
+        fs.WriteAll(u.filePath, u.jsCode)
+    }
+    outMulti, rcMulti := os.RunWithOutput(str.Concat("node ", str.Concat(multiDir, "/main.js")))
+    testing.AssertEqualInt(0, rcMulti, "Multi-file CJS main.js runs in node")
+    testing.AssertTrue(str.Contains(outMulti, "result:42"), "Multi-file CJS output is result:42")
+
+    // 3. UMD format execution in Node.js
+    cfgUMD := config.DefaultConfig()
+    cfgUMD.entry = mainMod
+    cfgUMD.format = "umd"
+    cfgUMD.globalName = "MyUMDLib"
+    cfgUMD.outDir = tmpDir
+    cfgUMD.outFile = "bundle.umd.cjs"
+    resUMD, errsUMD := transpiler.TranspileProgram(cfgUMD, skinkHome)
+    testing.AssertEqualInt(0, len(errsUMD), "UMD transpile errors == 0")
+    umdPath := resUMD.units[0].filePath
+    fs.WriteAll(umdPath, resUMD.units[0].jsCode)
+    outUMD, rcUMD := os.RunWithOutput(str.Concat("node ", umdPath))
+    testing.AssertEqualInt(0, rcUMD, "UMD runs in node")
+    testing.AssertTrue(str.Contains(outUMD, "result:42"), "UMD output is result:42")
+
+    // 4. ESM format execution in Node.js (.mjs)
+    cfgESM := config.DefaultConfig()
+    cfgESM.entry = mainMod
+    cfgESM.format = "esm"
+    cfgESM.outDir = tmpDir
+    cfgESM.outFile = "bundle.mjs"
+    resESM, errsESM := transpiler.TranspileProgram(cfgESM, skinkHome)
+    testing.AssertEqualInt(0, len(errsESM), "ESM transpile errors == 0")
+    esmPath := resESM.units[0].filePath
+    fs.WriteAll(esmPath, resESM.units[0].jsCode)
+    outESM, rcESM := os.RunWithOutput(str.Concat("node ", esmPath))
+    testing.AssertEqualInt(0, rcESM, "ESM .mjs runs in node")
+    testing.AssertTrue(str.Contains(outESM, "result:42"), "ESM output is result:42")
+
+    os.System(str.Concat("rm -rf ", tmpDir))
+}
+
+// TestCLIEndToEndConfigAndOverrides verifies the compiled `./skinkjs` binary
+// reading a `skinkjs.json` config file, applying CLI overrides, and emitting
+// runnable JavaScript and a `.map` file.
+pub fn TestCLIEndToEndConfigAndOverrides() {
+    if !fs.Exists("./skinkjs") {
+        return
+    }
+    tmpDir := "/tmp/skinkjs_test_cli"
+    os.System(str.Concat("rm -rf ", str.Concat(tmpDir, str.Concat(" && mkdir -p ", tmpDir))))
+
+    srcPath := str.Concat(tmpDir, "/hello.skink")
+    interpExpr := str.Concat("{", "name}")
+    srcCode := str.Concat(`module main
+
+fn safeRun() -> string {
+    defer {
+        r := recover()
+        if r != "" {
+            println("recovered:", r)
+        }
+    }
+    panic("boom")
+    return "unreachable"
+}
+
+fn main() {
+    name := "World"
+    println("interp: Hello `, str.Concat(interpExpr, `!")
+    _ = safeRun()
+    sum := 0
+    for i in 1..5 {
+        sum = sum + i
+    }
+    println("range_sum:", sum)
+}
+`))
+    fs.WriteAll(srcPath, srcCode)
+
+    cfgPath := str.Concat(tmpDir, "/skinkjs.json")
+    cfgJSON := `{
+  "entry": "/tmp/skinkjs_test_cli/hello.skink",
+  "format": "esm",
+  "outDir": "/tmp/skinkjs_test_cli",
+  "outFile": "from_cfg.js",
+  "minify": false,
+  "sourceMap": false
+}`
+    fs.WriteAll(cfgPath, cfgJSON)
+
+    // Invoke ./skinkjs with --config and override format to cjs, outFile to cli_out.cjs, --minify, --sourcemap
+    skinkHome := resolveTestSkinkHome()
+    cmd := str.Concat("SKINK_HOME=", str.Concat(skinkHome, str.Concat(" ./skinkjs --config ", str.Concat(cfgPath, " --format cjs --out-file cli_out.cjs --minify --sourcemap"))))
+    _, cliRc := os.RunWithOutput(cmd)
+    testing.AssertEqualInt(0, cliRc, "skinkjs CLI exited 0")
+
+    emittedJS := str.Concat(tmpDir, "/cli_out.cjs")
+    emittedMap := str.Concat(tmpDir, "/cli_out.cjs.map")
+    testing.AssertTrue(fs.Exists(emittedJS), "CLI emitted cli_out.cjs")
+    testing.AssertTrue(fs.Exists(emittedMap), "CLI emitted cli_out.cjs.map")
+
+    nodeOut, nodeRc := os.RunWithOutput(str.Concat("node ", emittedJS))
+    testing.AssertEqualInt(0, nodeRc, "CLI output runs in node")
+    testing.AssertTrue(str.Contains(nodeOut, "interp: Hello World!"), "string interpolation output")
+    testing.AssertTrue(str.Contains(nodeOut, "recovered:boom"), "panic/recover inside defer output")
+    testing.AssertTrue(str.Contains(nodeOut, "range_sum:10"), "range loop 1..5 sum output")
+
+    os.System(str.Concat("rm -rf ", tmpDir))
+}
+
+// TestDOMAndJSInterop verifies full type-checked access to `std/dom` and `std/js`
+// (element creation, querying by id/class/tag, attributes, classes, styles, dataset,
+// event listeners, programmatic click dispatch, localStorage, Canvas2D, and js.Value interop).
+pub fn TestDOMAndJSInterop() {
+    tmpDir := "/tmp/skinkjs_test_dom"
+    os.System(str.Concat("rm -rf ", str.Concat(tmpDir, str.Concat(" && mkdir -p ", tmpDir))))
+
+    srcPath := str.Concat(tmpDir, "/webapp.skink")
+    srcCode := `module main
+
+import "std/dom"
+import "std/js"
+import "std/strconv"
+
+var clickCount: int = 0
+
+fn onBtnClick(ev: dom.Event) {
+    clickCount = clickCount + 1
+    ev.PreventDefault()
+    btn := ev.Target()
+    btn.SetText("Clicked " + strconv.Itoa(clickCount))
+}
+
+fn main() {
+    dom.SetTitle("Skink Web App")
+    body := dom.Body()
+
+    card := dom.CreateElementWithClass("div", "card")
+    card.SetId("main-card")
+    card.SetAttr("role", "region")
+    card.SetData("theme", "dark")
+    card.AddClass("active")
+    card.SetStyle("padding", "16px")
+
+    heading := dom.CreateElementWithText("h1", "Welcome to SkinkJS")
+    card.Append(heading)
+
+    btn := dom.CreateElementWithText("button", "Click Me")
+    btn.SetId("action-btn")
+    btn.OnClick(onBtnClick)
+    card.Append(btn)
+
+    canvas := dom.CreateElement("canvas")
+    ctx := dom.GetCanvas2D(canvas)
+    ctx.SetFillStyle("#ff5500")
+    ctx.FillRect(0.0, 0.0, 100.0, 50.0)
+    card.Append(canvas)
+
+    body.Append(card)
+
+    found := dom.GetElementById("main-card")
+    println("title:", dom.Title())
+    println("card_exists:", found.Exists(), "role:", found.Attr("role"), "theme:", found.Data("theme"))
+    println("has_active:", found.HasClass("active"), "padding:", found.Style("padding"))
+
+    foundBtn := dom.Query("#action-btn")
+    foundBtn.Click()
+    foundBtn.Click()
+    println("btn_text:", foundBtn.Text(), "clicks:", clickCount)
+
+    dom.LocalStorageSet("user", "mark")
+    println("storage_user:", dom.LocalStorageGet("user"))
+
+    // Test std/js universal interop
+    obj := js.NewObject()
+    obj.SetString("lang", "Skink")
+    obj.SetInt("year", 2026)
+    arr := js.NewArray()
+    arr.Push(js.FromInt(10))
+    arr.Push(js.FromInt(20))
+    obj.Set("items", arr)
+    println("js_obj:", obj.Get("lang").String(), obj.Get("year").Int(), obj.Get("items").Length())
+
+    mathVal := js.Global().Get("Math").Call1("abs", js.FromInt(-42))
+    println("js_math_abs:", mathVal.Int())
+}
+`
+    fs.WriteAll(srcPath, srcCode)
+
+    cfg := config.DefaultConfig()
+    cfg.entry = srcPath
+    cfg.format = "cjs"
+    cfg.outDir = tmpDir
+    cfg.outFile = "webapp.cjs"
+
+    res, errs := transpiler.TranspileProgram(cfg, resolveTestSkinkHome())
+    if len(errs) > 0 {
+        for i := 0; i < len(errs); i = i + 1 {
+            println("dom transpile err:", errs[i])
+        }
+        testing.Errorf("DOM TranspileProgram returned errors")
+        return
+    }
+    outJS := res.units[0].filePath
+    fs.WriteAll(outJS, res.units[0].jsCode)
+
+    nodeOut, rc := os.RunWithOutput(str.Concat("node ", outJS))
+    testing.AssertEqualInt(0, rc, "DOM/JS webapp runs in Node")
+    testing.AssertTrue(str.Contains(nodeOut, "title:Skink Web App"), "dom.SetTitle / dom.Title")
+    testing.AssertTrue(str.Contains(nodeOut, "card_exists:truerole:regiontheme:dark"), "dom.GetElementById / Attr / Data")
+    testing.AssertTrue(str.Contains(nodeOut, "has_active:truepadding:16px"), "AddClass / HasClass / Style")
+    testing.AssertTrue(str.Contains(nodeOut, "btn_text:Clicked 2clicks:2"), "OnClick / Click event dispatch")
+    testing.AssertTrue(str.Contains(nodeOut, "storage_user:mark"), "LocalStorageSet / LocalStorageGet")
+    testing.AssertTrue(str.Contains(nodeOut, "js_obj:Skink20262"), "std/js object/array manipulation")
+    testing.AssertTrue(str.Contains(nodeOut, "js_math_abs:42"), "std/js Global().Get(\"Math\").Call1")
+
+    os.System(str.Concat("rm -rf ", tmpDir))
+}
+
+

@@ -1,0 +1,12 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: skinkjs — Skink to ECMAScript/JavaScript Transpiler
+//
+// File:    version.skink
+// Purpose: Version identifier for the skinkjs transpiler CLI.
+// Author:  Mark Oxley
+// Created: 2026
+
+module version
+
+pub const Version = "0.1.0"

@@ -1,0 +1,5 @@
+skinkjs
+*.ll
+*.o
+__skink_test_bin*
+dist/

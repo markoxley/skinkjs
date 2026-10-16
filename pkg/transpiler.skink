@@ -1,0 +1,2613 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: skinkjs — Skink to ECMAScript/JavaScript Transpiler
+//
+// File:    pkg/transpiler.skink
+// Purpose: Core AST-to-JavaScript/ECMAScript transpiler supporting all Skink
+//          declarations, statements, expressions, types, module formats
+//          (ESM, CJS, IIFE, UMD, script), single/multi-file emission,
+//          minification, and Source Map v3 generation.
+// Author:  Mark Oxley
+// Created: 2026
+
+module transpiler
+
+import "std/ast"
+import "std/str"
+import "std/strconv"
+import "std/fmt"
+import "std/fs"
+import "std/path"
+import "std/errors"
+import "std/resolver"
+import "std/checker"
+import "pkg/config"
+import "pkg/runtime"
+import "pkg/sourcemap"
+import "pkg/minify"
+
+// OutputUnit represents a single generated JavaScript file (and its optional
+// companion Source Map v3 file) produced by a transpilation run.
+pub struct OutputUnit {
+    filePath:      string // Target .js file path
+    jsCode:        string // Final JavaScript code
+    sourceMapPath: string // Target .js.map file path (empty if not written separately)
+    sourceMapJSON: string // Source Map v3 JSON content (empty if sourceMap is false)
+}
+
+// TranspileResult holds all output units produced from transpiling a Skink program.
+pub struct TranspileResult {
+    units:      []OutputUnit
+    entryModule: string
+    hasMain:    bool
+}
+
+// ModuleGroup collects all AST declarations belonging to a single resolved Skink module.
+struct ModuleGroup {
+    name:         string
+    filePath:     string
+    decls:        []ast.Stmt
+    imports:      []string
+    importAliases: map[string]string
+}
+
+// Transpiler holds state while lowering resolved Skink AST declarations to JavaScript.
+struct Transpiler {
+    cfg:               config.Config
+    out:               str.Builder
+    currentLine:       int
+    indentLevel:       int
+    currentModule:     string
+    currentFile:       string
+    currentSrcIdx:     int
+    sm:                sourcemap.SourceMapBuilder
+    importAliases:     map[string]string
+    importedModules:   map[string]bool
+    knownStructs:      map[string]ast.Decl
+    structMethods:     map[string][]string
+    knownEnums:        map[string]ast.Decl
+    knownFunctions:    map[string]bool
+    knownConsts:       map[string]bool
+    knownGlobals:      map[string]bool
+    fnRetIsFloat:      map[string]bool
+    globalIsFloat:     map[string]bool
+    localIsFloat:      map[string]bool
+    localIsStruct:     map[string]string
+    currentFnHasDefer: bool
+    currentFnHasErrProp: bool
+    currentFnRetTypes: []ast.Type
+    currentFnRetNames: []string
+    tempCounter:       int
+    exportedSymbols:   []string
+    exportedJSNames:   []string
+    hasMainFn:         bool
+    multiFileMode:     bool
+}
+
+// newTranspiler initializes a fresh Transpiler for the given Config and output file name.
+fn newTranspiler(cfg: config.Config, outFileName: string) -> Transpiler {
+    var emptyMethodMap map[string][]string
+    emptyMethodMap = make(map[string][]string)
+    var emptyRetTypes []ast.Type
+    var emptyRetNames []string
+    var emptyExports []string
+    var emptyExportJS []string
+    return Transpiler{
+        cfg:                 cfg,
+        out:                 str.NewBuilder(8192),
+        currentLine:         1,
+        indentLevel:         0,
+        currentModule:       "main",
+        currentFile:         "",
+        currentSrcIdx:       -1,
+        sm:                  sourcemap.NewBuilder(path.Base(outFileName)),
+        importAliases:       make(map[string]string),
+        importedModules:     make(map[string]bool),
+        knownStructs:        make(map[string]ast.Decl),
+        structMethods:       emptyMethodMap,
+        knownEnums:          make(map[string]ast.Decl),
+        knownFunctions:      make(map[string]bool),
+        knownConsts:         make(map[string]bool),
+        knownGlobals:        make(map[string]bool),
+        fnRetIsFloat:        make(map[string]bool),
+        globalIsFloat:       make(map[string]bool),
+        localIsFloat:        make(map[string]bool),
+        localIsStruct:       make(map[string]string),
+        currentFnHasDefer:   false,
+        currentFnHasErrProp: false,
+        currentFnRetTypes:   emptyRetTypes,
+        currentFnRetNames:   emptyRetNames,
+        tempCounter:         0,
+        exportedSymbols:     emptyExports,
+        exportedJSNames:     emptyExportJS,
+        hasMainFn:           false,
+        multiFileMode:       !cfg.bundle
+    }
+}
+
+// nextTemp returns a unique temporary JS identifier `__tmp_N`.
+fn nextTemp(t: *Transpiler, prefix: string) -> string {
+    t.tempCounter = t.tempCounter + 1
+    return str.Concat("__", str.Concat(prefix, str.Concat("_", strconv.Itoa(t.tempCounter))))
+}
+
+// writeRaw appends text to t.out and updates t.currentLine for every newline.
+fn writeRaw(t: *Transpiler, text: string) {
+    n := str.Len(text)
+    for i := 0; i < n; i = i + 1 {
+        if int(text[i]) == 10 {
+            t.currentLine = t.currentLine + 1
+        }
+    }
+    str.Write(&t.out, text)
+}
+
+// writeIndent writes spaces for the current indentation level.
+fn writeIndent(t: *Transpiler) {
+    for i := 0; i < t.indentLevel; i = i + 1 {
+        str.Write(&t.out, "  ")
+    }
+}
+
+// emitLine writes an indented line followed by a newline.
+fn emitLine(t: *Transpiler, line: string) {
+    writeIndent(t)
+    writeRaw(t, line)
+    writeRaw(t, "\n")
+}
+
+// emitMappedLine records a source map entry for (srcLine, srcCol) at the current
+// generated line, then emits line with indentation.
+fn emitMappedLine(t: *Transpiler, srcLine: int, srcCol: int, line: string) {
+    if t.cfg.sourceMap && t.currentSrcIdx >= 0 && srcLine > 0 {
+        sourcemap.AddMapping(&t.sm, t.currentLine, t.indentLevel * 2, t.currentSrcIdx, srcLine, srcCol)
+    }
+    emitLine(t, line)
+}
+
+// registerSourceFile ensures filePath is registered in the SourceMapBuilder and sets currentSrcIdx.
+fn setCurrentSourceFile(t: *Transpiler, filePath: string) {
+    if str.Len(filePath) == 0 {
+        return
+    }
+    t.currentFile = filePath
+    if t.cfg.sourceMap {
+        content := ""
+        if t.cfg.includeSources && fs.Exists(filePath) {
+            c, err := fs.ReadAll(filePath)
+            if err.message == "" {
+                content = c
+            }
+        }
+        t.currentSrcIdx = sourcemap.AddSource(&t.sm, filePath, content)
+    }
+}
+
+// sanitizeJSIdent converts a Skink identifier or module-qualified name (`mod.Name`)
+// into a valid JavaScript identifier (`mod_Name`), escaping JS reserved words.
+pub fn SanitizeJSIdent(name: string) -> string {
+    if str.Len(name) == 0 {
+        return "_anon"
+    }
+    s := str.Replace(str.Replace(name, ".", "_"), "-", "_")
+    if str.Equal(s, "class") || str.Equal(s, "function") || str.Equal(s, "default") ||
+       str.Equal(s, "delete") || str.Equal(s, "export") || str.Equal(s, "extends") ||
+       str.Equal(s, "finally") || str.Equal(s, "in") || str.Equal(s, "instanceof") ||
+       str.Equal(s, "new") || str.Equal(s, "super") || str.Equal(s, "this") ||
+       str.Equal(s, "throw") || str.Equal(s, "try") || str.Equal(s, "typeof") ||
+       str.Equal(s, "var") || str.Equal(s, "void") || str.Equal(s, "with") ||
+       str.Equal(s, "yield") || str.Equal(s, "let") || str.Equal(s, "debugger") ||
+       str.Equal(s, "arguments") || str.Equal(s, "eval") {
+        return str.Concat(s, "_$")
+    }
+    return s
+}
+
+// unqualifyName strips any leading `module.` prefix from a qualified symbol name.
+fn unqualifyName(name: string) -> string {
+    dot := str.LastIndexOf(name, ".")
+    if dot >= 0 {
+        return str.Substr(name, dot + 1, str.Len(name) - dot - 1)
+    }
+    return name
+}
+
+// isFloatASTType reports whether an ast.Type represents a floating-point number.
+fn isFloatASTType(ty: ast.Type) -> bool {
+    if ty.kind == ast.TY_NAMED {
+        return str.Equal(ty.name, "float") || str.Equal(ty.name, "float32") || str.Equal(ty.name, "float64")
+    }
+    return false
+}
+
+// defaultValueForType returns the JavaScript zero-value expression for a Skink AST type.
+fn defaultValueForType(t: *Transpiler, ty: ast.Type) -> string {
+    if ty.kind == ast.TY_ARRAY {
+        return "[]"
+    }
+    if ty.kind == ast.TY_MAP {
+        return "{}"
+    }
+    if ty.kind == ast.TY_SET {
+        return "new Set()"
+    }
+    if ty.kind == ast.TY_CHAN {
+        return "__skink.makeChan(0)"
+    }
+    if ty.kind == ast.TY_TENSOR {
+        return "__skink.makeTensor([0], 0)"
+    }
+    if ty.kind == ast.TY_POINTER {
+        return "null"
+    }
+    if ty.kind == ast.TY_TUPLE {
+        parts := []string{}
+        for i := 0; i < len(ty.tupleTypes); i = i + 1 {
+            parts = append(parts, defaultValueForType(t, ty.tupleTypes[i]))
+        }
+        return str.Concat("[", str.Concat(str.Join(parts, ", "), "]"))
+    }
+    if ty.kind == ast.TY_NAMED {
+        n := ty.name
+        if str.Equal(n, "int") || str.Equal(n, "int8") || str.Equal(n, "int16") ||
+           str.Equal(n, "int32") || str.Equal(n, "int64") || str.Equal(n, "uint") ||
+           str.Equal(n, "uint8") || str.Equal(n, "uint16") || str.Equal(n, "uint32") ||
+           str.Equal(n, "uint64") || str.Equal(n, "byte") {
+            return "0"
+        }
+        if str.Equal(n, "float") || str.Equal(n, "float32") || str.Equal(n, "float64") {
+            return "0.0"
+        }
+        if str.Equal(n, "string") {
+            return "\"\""
+        }
+        if str.Equal(n, "bool") {
+            return "false"
+        }
+        if str.Equal(n, "error") || str.Equal(n, "errors.Error") {
+            return "errors_None()"
+        }
+        structKey := resolveTypeKey(t, n)
+        if str.Len(t.knownStructs[structKey].structName) > 0 {
+            return str.Concat("__make_", str.Concat(SanitizeJSIdent(structKey), "()"))
+        }
+        enumKey := resolveEnumKey(t, n)
+        if str.Len(t.knownEnums[enumKey].enumName) > 0 {
+            ed := t.knownEnums[enumKey]
+            if len(ed.enumVariants) > 0 {
+                return str.Concat(SanitizeJSIdent(enumKey), str.Concat(".", ed.enumVariants[0].name))
+            }
+            return "0"
+        }
+    }
+    return "null"
+}
+
+// sizeofASTType returns an approximate byte size for `sizeof(T)` expressions.
+fn sizeofASTType(t: *Transpiler, ty: ast.Type) -> int {
+    if ty.kind == ast.TY_POINTER || ty.kind == ast.TY_ARRAY || ty.kind == ast.TY_MAP || ty.kind == ast.TY_SET || ty.kind == ast.TY_CHAN {
+        return 8
+    }
+    if ty.kind == ast.TY_NAMED {
+        n := ty.name
+        if str.Equal(n, "bool") || str.Equal(n, "byte") || str.Equal(n, "int8") || str.Equal(n, "uint8") {
+            return 1
+        }
+        if str.Equal(n, "int16") || str.Equal(n, "uint16") {
+            return 2
+        }
+        if str.Equal(n, "int") || str.Equal(n, "int32") || str.Equal(n, "uint") || str.Equal(n, "uint32") || str.Equal(n, "float32") {
+            return 4
+        }
+        if str.Equal(n, "int64") || str.Equal(n, "uint64") || str.Equal(n, "float") || str.Equal(n, "float64") || str.Equal(n, "string") {
+            return 8
+        }
+        sk := resolveTypeKey(t, n)
+        sd := t.knownStructs[sk]
+        if str.Len(sd.structName) > 0 {
+            total := 0
+            for i := 0; i < len(sd.structFields); i = i + 1 {
+                if len(sd.structFields[i].typ) > 0 {
+                    total = total + sizeofASTType(t, sd.structFields[i].typ[0])
+                } else {
+                    total = total + 8
+                }
+            }
+            if total == 0 { return 1 }
+            return total
+        }
+    }
+    return 8
+}
+
+// alignofASTType returns the alignment in bytes for `alignof(T)` expressions.
+fn alignofASTType(t: *Transpiler, ty: ast.Type) -> int {
+    sz := sizeofASTType(t, ty)
+    if sz >= 8 { return 8 }
+    if sz >= 4 { return 4 }
+    if sz >= 2 { return 2 }
+    return 1
+}
+
+// resolveTypeKey resolves a struct type name relative to the current module or import aliases.
+fn resolveTypeKey(t: *Transpiler, rawName: string) -> string {
+    if str.Len(t.knownStructs[rawName].structName) > 0 {
+        return rawName
+    }
+    if !str.Contains(rawName, ".") && !str.Equal(t.currentModule, "main") && str.Len(t.currentModule) > 0 {
+        qual := str.Concat(t.currentModule, str.Concat(".", rawName))
+        if str.Len(t.knownStructs[qual].structName) > 0 {
+            return qual
+        }
+    }
+    if str.Contains(rawName, ".") {
+        dot := str.IndexOf(rawName, ".")
+        prefix := str.Substr(rawName, 0, dot)
+        rest := str.Substr(rawName, dot + 1, str.Len(rawName) - dot - 1)
+        mapped := t.importAliases[prefix]
+        if str.Len(mapped) > 0 {
+            cand := str.Concat(mapped, str.Concat(".", rest))
+            if str.Len(t.knownStructs[cand].structName) > 0 {
+                return cand
+            }
+        }
+    }
+    return rawName
+}
+
+// resolveEnumKey resolves an enum type name relative to the current module or import aliases.
+fn resolveEnumKey(t: *Transpiler, rawName: string) -> string {
+    if str.Len(t.knownEnums[rawName].enumName) > 0 {
+        return rawName
+    }
+    if !str.Contains(rawName, ".") && !str.Equal(t.currentModule, "main") && str.Len(t.currentModule) > 0 {
+        qual := str.Concat(t.currentModule, str.Concat(".", rawName))
+        if str.Len(t.knownEnums[qual].enumName) > 0 {
+            return qual
+        }
+    }
+    if str.Contains(rawName, ".") {
+        dot := str.IndexOf(rawName, ".")
+        prefix := str.Substr(rawName, 0, dot)
+        rest := str.Substr(rawName, dot + 1, str.Len(rawName) - dot - 1)
+        mapped := t.importAliases[prefix]
+        if str.Len(mapped) > 0 {
+            cand := str.Concat(mapped, str.Concat(".", rest))
+            if str.Len(t.knownEnums[cand].enumName) > 0 {
+                return cand
+            }
+        }
+    }
+    return rawName
+}
+
+// registerDeclarations scans all resolved declarations in pass 1 to populate symbol tables
+// for structs, methods, enums, functions, constants, and global variables.
+fn registerDeclarations(t: *Transpiler, decls: []ast.Stmt) {
+    curMod := "main"
+    for i := 0; i < len(decls); i = i + 1 {
+        stmt := decls[i]
+        if stmt.kind == ast.ST_MODULE {
+            curMod = stmt.decl.moduleName
+            if str.Len(curMod) == 0 {
+                curMod = "main"
+            }
+            continue
+        }
+        if runtime.IsRuntimeBackedStdModule(curMod) {
+            continue
+        }
+        d := stmt.decl
+        if stmt.kind == ast.ST_STRUCT {
+            t.knownStructs[d.structName] = d
+            var mlist []string
+            for m := 0; m < len(d.structMethods); m = m + 1 {
+                mlist = append(mlist, d.structMethods[m].fnName)
+            }
+            t.structMethods[d.structName] = mlist
+        } else if stmt.kind == ast.ST_ENUM {
+            t.knownEnums[d.enumName] = d
+            for v := 0; v < len(d.enumVariants); v = v + 1 {
+                vQual := d.enumVariants[v].name
+                if !str.Equal(curMod, "main") {
+                    vQual = str.Concat(curMod, str.Concat(".", vQual))
+                }
+                t.knownFunctions[vQual] = true
+            }
+        } else if stmt.kind == ast.ST_FN {
+            if len(d.fnReceiver) > 0 {
+                recvT := d.fnReceiver[0]
+                recvName := recvT.name
+                if recvT.kind == ast.TY_POINTER && len(recvT.elem) > 0 {
+                    recvName = recvT.elem[0].name
+                }
+                if !str.Contains(recvName, ".") && !str.Equal(curMod, "main") {
+                    recvName = str.Concat(curMod, str.Concat(".", recvName))
+                }
+                existing := t.structMethods[recvName]
+                methodShort := unqualifyName(d.fnName)
+                existing = append(existing, methodShort)
+                t.structMethods[recvName] = existing
+                qualMethod := str.Concat(recvName, str.Concat("_", methodShort))
+                t.knownFunctions[qualMethod] = true
+            } else {
+                t.knownFunctions[d.fnName] = true
+                if len(d.fnRetTypes) == 1 && isFloatASTType(d.fnRetTypes[0]) {
+                    t.fnRetIsFloat[d.fnName] = true
+                }
+            }
+        } else if stmt.kind == ast.ST_CONST {
+            if str.Len(d.constName) > 0 {
+                t.knownConsts[d.constName] = true
+                if len(d.constValue) > 0 && d.constValue[0].kind == ast.EX_FLOAT {
+                    t.globalIsFloat[d.constName] = true
+                }
+            }
+            for c := 0; c < len(d.constBlock); c = c + 1 {
+                item := d.constBlock[c]
+                t.knownConsts[item.name] = true
+                if len(item.value) > 0 && item.value[0].kind == ast.EX_FLOAT {
+                    t.globalIsFloat[item.name] = true
+                }
+            }
+        } else if stmt.kind == ast.ST_VARDECL {
+            t.knownGlobals[stmt.varName] = true
+            if len(stmt.varType) > 0 && isFloatASTType(stmt.varType[0]) {
+                t.globalIsFloat[stmt.varName] = true
+            } else if len(stmt.varValue) > 0 && stmt.varValue[0].kind == ast.EX_FLOAT {
+                t.globalIsFloat[stmt.varName] = true
+            }
+        } else if stmt.kind == ast.ST_RULESET {
+            t.knownFunctions[d.rulesetName] = true
+        } else if stmt.kind == ast.ST_SERVICE {
+            t.knownConsts[d.serviceName] = true
+        }
+    }
+}
+
+// isFloatExpr estimates whether an expression evaluates to a floating-point number,
+// allowing `/` to emit `Math.trunc(a / b)` for integer division and `a / b` for floats.
+fn isFloatExpr(t: *Transpiler, e: ast.Expr) -> bool {
+    if e.kind == ast.EX_FLOAT {
+        return true
+    }
+    if e.kind == ast.EX_INT {
+        return false
+    }
+    if e.kind == ast.EX_PAREN && len(e.inner) > 0 {
+        return isFloatExpr(t, e.inner[0])
+    }
+    if e.kind == ast.EX_PREFIX && len(e.prefixRight) > 0 {
+        return isFloatExpr(t, e.prefixRight[0])
+    }
+    if e.kind == ast.EX_INFIX && len(e.infixLeft) > 0 && len(e.infixRight) > 0 {
+        return isFloatExpr(t, e.infixLeft[0]) || isFloatExpr(t, e.infixRight[0])
+    }
+    if e.kind == ast.EX_IDENT {
+        if t.localIsFloat[e.ident] || t.globalIsFloat[e.ident] {
+            return true
+        }
+        if !str.Equal(t.currentModule, "main") {
+            qual := str.Concat(t.currentModule, str.Concat(".", e.ident))
+            if t.globalIsFloat[qual] {
+                return true
+            }
+        }
+        return false
+    }
+    if e.kind == ast.EX_CALL && len(e.callFunc) > 0 {
+        callee := e.callFunc[0]
+        if callee.kind == ast.EX_IDENT {
+            n := callee.ident
+            if str.Equal(n, "float") || str.Equal(n, "float32") || str.Equal(n, "float64") ||
+               str.Equal(n, "sqrt") || str.Equal(n, "sin") || str.Equal(n, "cos") ||
+               str.Equal(n, "tan") || str.Equal(n, "pow") {
+                return true
+            }
+            if t.fnRetIsFloat[n] {
+                return true
+            }
+            if !str.Equal(t.currentModule, "main") {
+                qual := str.Concat(t.currentModule, str.Concat(".", n))
+                if t.fnRetIsFloat[qual] {
+                    return true
+                }
+            }
+        }
+        if callee.kind == ast.EX_FIELD && len(callee.fieldTarget) > 0 {
+            target := callee.fieldTarget[0]
+            if target.kind == ast.EX_IDENT && str.Equal(target.ident, "math") {
+                return true
+            }
+            if target.kind == ast.EX_IDENT {
+                modName := t.importAliases[target.ident]
+                if str.Len(modName) == 0 {
+                    modName = target.ident
+                }
+                qual := str.Concat(modName, str.Concat(".", callee.fieldName))
+                if t.fnRetIsFloat[qual] {
+                    return true
+                }
+            }
+        }
+    }
+    if e.kind == ast.EX_FIELD && len(e.fieldTarget) > 0 {
+        target := e.fieldTarget[0]
+        if target.kind == ast.EX_IDENT && str.Equal(target.ident, "math") {
+            return true
+        }
+    }
+    return false
+}
+
+// escapeJSString formats a raw string value as a double-quoted JavaScript string literal.
+fn escapeJSString(s: string) -> string {
+    sb := str.NewBuilder(str.Len(s) + 8)
+    str.Write(&sb, "\"")
+    n := str.Len(s)
+    for i := 0; i < n; i = i + 1 {
+        c := int(s[i])
+        if c == 34 {
+            str.Write(&sb, "\\\"")
+        } else if c == 92 {
+            str.Write(&sb, "\\\\")
+        } else if c == 10 {
+            str.Write(&sb, "\\n")
+        } else if c == 13 {
+            str.Write(&sb, "\\r")
+        } else if c == 9 {
+            str.Write(&sb, "\\t")
+        } else if c == 0 {
+            str.Write(&sb, "\\0")
+        } else {
+            str.WriteByte(&sb, c)
+        }
+    }
+    str.Write(&sb, "\"")
+    res := str.String(sb)
+    str.Free(&sb)
+    return res
+}
+
+// escapeTemplatePart escapes a literal text segment inside a JS template literal (`...`).
+fn escapeTemplatePart(s: string) -> string {
+    sb := str.NewBuilder(str.Len(s) + 8)
+    n := str.Len(s)
+    for i := 0; i < n; i = i + 1 {
+        c := int(s[i])
+        if c == 96 { // `
+            str.Write(&sb, "\\`")
+        } else if c == 92 { // \
+            str.Write(&sb, "\\\\")
+        } else if c == 36 && i + 1 < n && int(s[i + 1]) == 123 { // ${
+            str.Write(&sb, "\\$")
+        } else {
+            str.WriteByte(&sb, c)
+        }
+    }
+    res := str.String(sb)
+    str.Free(&sb)
+    return res
+}
+
+// resolveIdentJS resolves an EX_IDENT name to its emitted JavaScript identifier.
+fn resolveIdentJS(t: *Transpiler, rawIdent: string) -> string {
+    if str.Equal(rawIdent, "true") || str.Equal(rawIdent, "false") {
+        return rawIdent
+    }
+    if str.Equal(rawIdent, "nil") {
+        return "null"
+    }
+    // Check if rawIdent is a module-level symbol in currentModule (when currentModule != "main")
+    if !str.Contains(rawIdent, ".") && !str.Equal(t.currentModule, "main") && str.Len(t.currentModule) > 0 {
+        qual := str.Concat(t.currentModule, str.Concat(".", rawIdent))
+        if t.knownFunctions[qual] || t.knownConsts[qual] || t.knownGlobals[qual] ||
+           str.Len(t.knownStructs[qual].structName) > 0 || str.Len(t.knownEnums[qual].enumName) > 0 {
+            return SanitizeJSIdent(qual)
+        }
+    }
+    return SanitizeJSIdent(rawIdent)
+}
+
+// resolveModulePrefix checks if ident refers to an imported module (or alias)
+// and returns (canonicalModuleName, isModule).
+fn resolveModulePrefix(t: *Transpiler, ident: string) -> (string, bool) {
+    aliased := t.importAliases[ident]
+    if str.Len(aliased) > 0 {
+        return aliased, true
+    }
+    if t.importedModules[ident] {
+        return ident, true
+    }
+    if runtime.IsRuntimeBackedStdModule(ident) {
+        return ident, true
+    }
+    return "", false
+}
+
+// emitFieldExpr lowers an EX_FIELD expression (`target.fieldName`).
+fn emitFieldExpr(t: *Transpiler, e: ast.Expr) -> string {
+    if len(e.fieldTarget) == 0 {
+        return SanitizeJSIdent(e.fieldName)
+    }
+    target := e.fieldTarget[0]
+
+    // Check if target is a module identifier or enum type name
+    if target.kind == ast.EX_IDENT {
+        // 1. Check if target is an enum in the current or root scope
+        enumKey := resolveEnumKey(t, target.ident)
+        if str.Len(t.knownEnums[enumKey].enumName) > 0 {
+            return str.Concat(SanitizeJSIdent(enumKey), str.Concat(".", e.fieldName))
+        }
+        // 2. Check if target is an imported module alias / name
+        modName, isMod := resolveModulePrefix(t, target.ident)
+        if isMod {
+            // Runtime-backed stdlib modules always use `<mod>_<Member>`
+            if runtime.IsRuntimeBackedStdModule(modName) {
+                return str.Concat(SanitizeJSIdent(modName), str.Concat("_", e.fieldName))
+            }
+            // In multi-file mode, user module imports use namespace property `alias.mod_Member`
+            if t.multiFileMode {
+                qualSym := SanitizeJSIdent(str.Concat(modName, str.Concat(".", e.fieldName)))
+                return str.Concat(SanitizeJSIdent(target.ident), str.Concat(".", qualSym))
+            }
+            return SanitizeJSIdent(str.Concat(modName, str.Concat(".", e.fieldName)))
+        }
+    }
+
+    // Check if target is `mod.EnumName.Variant`
+    if target.kind == ast.EX_FIELD && len(target.fieldTarget) > 0 && target.fieldTarget[0].kind == ast.EX_IDENT {
+        modName, isMod := resolveModulePrefix(t, target.fieldTarget[0].ident)
+        if isMod {
+            enumKey := str.Concat(modName, str.Concat(".", target.fieldName))
+            if str.Len(t.knownEnums[enumKey].enumName) > 0 {
+                if t.multiFileMode && !runtime.IsRuntimeBackedStdModule(modName) {
+                    return str.Concat(SanitizeJSIdent(target.fieldTarget[0].ident), str.Concat(".", str.Concat(SanitizeJSIdent(enumKey), str.Concat(".", e.fieldName))))
+                }
+                return str.Concat(SanitizeJSIdent(enumKey), str.Concat(".", e.fieldName))
+            }
+        }
+    }
+
+    targetJS := emitExpr(t, target)
+    return str.Concat(targetJS, str.Concat(".", SanitizeJSIdent(e.fieldName)))
+}
+
+// emitCallExpr lowers an EX_CALL expression (`callee(args...)`).
+fn emitCallExpr(t: *Transpiler, e: ast.Expr) -> string {
+    if len(e.callFunc) == 0 {
+        return "undefined"
+    }
+    callee := e.callFunc[0]
+
+    var argStrs []string
+    for i := 0; i < len(e.callArgs); i = i + 1 {
+        argStrs = append(argStrs, emitExpr(t, e.callArgs[i]))
+    }
+    joinedArgs := str.Join(argStrs, ", ")
+
+    // Handle built-in functions and type conversions when callee is EX_IDENT
+    if callee.kind == ast.EX_IDENT {
+        fnName := callee.ident
+        if str.Equal(fnName, "print") {
+            return str.Concat("__skink.print(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "println") {
+            return str.Concat("__skink.println(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "len") {
+            return str.Concat("__skink.len(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "cap") {
+            return str.Concat("__skink.cap(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "append") {
+            return str.Concat("__skink.append(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "copy") {
+            return str.Concat("__skink.copy(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "delete") {
+            return str.Concat("__skink.del(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "clear") {
+            return str.Concat("__skink.clear(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "contains") {
+            return str.Concat("__skink.contains(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "close") {
+            return str.Concat("__skink.closeChan(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "panic") {
+            return str.Concat("__skink.panic(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "recover") {
+            return "__skink.recover()"
+        }
+        if str.Equal(fnName, "assert") {
+            return str.Concat("__skink.assert(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "min") {
+            return str.Concat("Math.min(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "max") {
+            return str.Concat("Math.max(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "abs") {
+            return str.Concat("Math.abs(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "sqrt") {
+            return str.Concat("Math.sqrt(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "sin") {
+            return str.Concat("Math.sin(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "cos") {
+            return str.Concat("Math.cos(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "tan") {
+            return str.Concat("Math.tan(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "pow") {
+            return str.Concat("Math.pow(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "int") || str.Equal(fnName, "int8") || str.Equal(fnName, "int16") ||
+           str.Equal(fnName, "int32") || str.Equal(fnName, "int64") || str.Equal(fnName, "uint") ||
+           str.Equal(fnName, "uint8") || str.Equal(fnName, "uint16") || str.Equal(fnName, "uint32") ||
+           str.Equal(fnName, "uint64") || str.Equal(fnName, "byte") {
+            return str.Concat("__skink.toInt(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "float") || str.Equal(fnName, "float32") || str.Equal(fnName, "float64") {
+            return str.Concat("__skink.toFloat(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "string") {
+            return str.Concat("__skink.toString(", str.Concat(joinedArgs, ")"))
+        }
+        if str.Equal(fnName, "bool") {
+            return str.Concat("Boolean(", str.Concat(joinedArgs, ")"))
+        }
+    }
+
+    calleeJS := emitExpr(t, callee)
+    return str.Concat(calleeJS, str.Concat("(", str.Concat(joinedArgs, ")")))
+}
+
+// emitAddressOf lowers `&target` using `__skink.addrOf(getter, setter)` so pointer
+// dereferences `*p` and mutations `*p = val` or `p.field = val` work in JavaScript.
+fn emitAddressOf(t: *Transpiler, target: ast.Expr) -> string {
+    if target.kind == ast.EX_IDENT {
+        id := resolveIdentJS(t, target.ident)
+        return str.Concat("__skink.addrOf(() => ", str.Concat(id, str.Concat(", (__v) => { ", str.Concat(id, " = __v; })"))))
+    }
+    if target.kind == ast.EX_FIELD && len(target.fieldTarget) > 0 {
+        objJS := emitExpr(t, target.fieldTarget[0])
+        fld := SanitizeJSIdent(target.fieldName)
+        acc := str.Concat(objJS, str.Concat(".", fld))
+        return str.Concat("__skink.addrOf(() => ", str.Concat(acc, str.Concat(", (__v) => { ", str.Concat(acc, " = __v; })"))))
+    }
+    if target.kind == ast.EX_INDEX && len(target.indexTarget) > 0 && len(target.indexExpr) > 0 {
+        arrJS := emitExpr(t, target.indexTarget[0])
+        idxJS := emitExpr(t, target.indexExpr[0])
+        acc := str.Concat(arrJS, str.Concat("[", str.Concat(idxJS, "]")))
+        return str.Concat("__skink.addrOf(() => ", str.Concat(acc, str.Concat(", (__v) => { ", str.Concat(acc, " = __v; })"))))
+    }
+    return emitExpr(t, target)
+}
+
+// emitStructLit lowers `StructName{ field1: val1, ... }` to `__make_StructName({ ... })`.
+fn emitStructLit(t: *Transpiler, e: ast.Expr) -> string {
+    rawName := e.structLitName
+    if str.Contains(rawName, "<") {
+        lt := str.IndexOf(rawName, "<")
+        rawName = str.Substr(rawName, 0, lt)
+    }
+    structKey := resolveTypeKey(t, rawName)
+    var pairs []string
+    for i := 0; i < len(e.structLitFields); i = i + 1 {
+        f := e.structLitFields[i]
+        valJS := "null"
+        if len(f.value) > 0 {
+            valJS = emitExpr(t, f.value[0])
+        }
+        pairs = append(pairs, str.Concat(SanitizeJSIdent(f.name), str.Concat(": ", valJS)))
+    }
+    objLit := str.Concat("{ ", str.Concat(str.Join(pairs, ", "), " }"))
+    if len(pairs) == 0 {
+        objLit = "{}"
+    }
+    if str.Len(t.knownStructs[structKey].structName) > 0 {
+        makerName := str.Concat("__make_", SanitizeJSIdent(structKey))
+        if t.multiFileMode && str.Contains(e.structLitName, ".") {
+            dot := str.IndexOf(e.structLitName, ".")
+            prefix := str.Substr(e.structLitName, 0, dot)
+            modName, isMod := resolveModulePrefix(t, prefix)
+            if isMod && !runtime.IsRuntimeBackedStdModule(modName) {
+                return str.Concat(SanitizeJSIdent(prefix), str.Concat(".", str.Concat(makerName, str.Concat("(", str.Concat(objLit, ")")))))
+            }
+        }
+        return str.Concat(makerName, str.Concat("(", str.Concat(objLit, ")")))
+    }
+    if str.Equal(structKey, "errors.Error") || str.Equal(rawName, "errors.Error") {
+        msgVal := "\"\""
+        for i := 0; i < len(e.structLitFields); i = i + 1 {
+            if str.Equal(e.structLitFields[i].name, "message") && len(e.structLitFields[i].value) > 0 {
+                msgVal = emitExpr(t, e.structLitFields[i].value[0])
+            }
+        }
+        return str.Concat("errors_New(", str.Concat(msgVal, ")"))
+    }
+    sep := ""
+    if len(pairs) > 0 {
+        sep = ", "
+    }
+    return str.Concat("{ __type: ", str.Concat(escapeJSString(structKey), str.Concat(sep, str.Concat(str.Join(pairs, ", "), " }"))))
+}
+
+// emitMakeExpr lowers `make(T, size?)` expressions.
+fn emitMakeExpr(t: *Transpiler, e: ast.Expr) -> string {
+    if len(e.makeType) == 0 {
+        return "[]"
+    }
+    ty := e.makeType[0]
+    if ty.kind == ast.TY_MAP {
+        return "{}"
+    }
+    if ty.kind == ast.TY_SET {
+        return "new Set()"
+    }
+    if ty.kind == ast.TY_CHAN {
+        if len(e.makeSize) > 0 {
+            return str.Concat("__skink.makeChan(", str.Concat(emitExpr(t, e.makeSize[0]), ")"))
+        }
+        return "__skink.makeChan(0)"
+    }
+    if ty.kind == ast.TY_TENSOR {
+        if len(e.makeSize) > 0 {
+            return str.Concat("__skink.makeTensor(", str.Concat(emitExpr(t, e.makeSize[0]), ", 0)"))
+        }
+        return "__skink.makeTensor([0], 0)"
+    }
+    if ty.kind == ast.TY_ARRAY {
+        if len(e.makeSize) > 0 {
+            szJS := emitExpr(t, e.makeSize[0])
+            elemDefault := "null"
+            if len(ty.elem) > 0 {
+                elemDefault = defaultValueForType(t, ty.elem[0])
+            }
+            return str.Concat("new Array(", str.Concat(szJS, str.Concat(").fill(", str.Concat(elemDefault, ")"))))
+        }
+        return "[]"
+    }
+    return defaultValueForType(t, ty)
+}
+
+// buildPatternCondition constructs the boolean JS condition and variable bindings
+// for a single `match` arm pattern against `subjVar`.
+fn buildPatternCondition(t: *Transpiler, pat: ast.Pattern, subjVar: string) -> (string, []string) {
+    var bindings []string
+    if pat.kind == ast.PK_WILDCARD {
+        return "true", bindings
+    }
+    if pat.kind == ast.PK_INT {
+        lit := strconv.Itoa(pat.intVal)
+        if str.Len(pat.strVal) > 0 {
+            lit = pat.strVal
+        }
+        return str.Concat(subjVar, str.Concat(" === ", lit)), bindings
+    }
+    if pat.kind == ast.PK_STRING {
+        return str.Concat(subjVar, str.Concat(" === ", escapeJSString(pat.strVal))), bindings
+    }
+    if pat.kind == ast.PK_BOOL {
+        bLit := "false"
+        if pat.boolVal {
+            bLit = "true"
+        }
+        return str.Concat(subjVar, str.Concat(" === ", bLit)), bindings
+    }
+    if pat.kind == ast.PK_NIL {
+        return str.Concat("(", str.Concat(subjVar, str.Concat(" === null || ", str.Concat(subjVar, " === undefined)")))), bindings
+    }
+    if pat.kind == ast.PK_RANGE {
+        lowJS := strconv.Itoa(pat.rangeLow)
+        highJS := strconv.Itoa(pat.rangeHigh)
+        cond := str.Concat("(", str.Concat(subjVar, str.Concat(" >= ", str.Concat(lowJS, str.Concat(" && ", str.Concat(subjVar, str.Concat(" <= ", str.Concat(highJS, ")"))))))))
+        return cond, bindings
+    }
+    if pat.kind == ast.PK_VARIANT {
+        vName := pat.variantName
+        cond := str.Concat("__skink.matchVariant(", str.Concat(subjVar, str.Concat(", ", str.Concat(escapeJSString(vName), ")"))))
+        for i := 0; i < len(pat.bindings); i = i + 1 {
+            bName := pat.bindings[i]
+            if !str.Equal(bName, "_") && str.Len(bName) > 0 {
+                bindLine := str.Concat("const ", str.Concat(SanitizeJSIdent(bName), str.Concat(" = ", str.Concat(subjVar, str.Concat("._", str.Concat(strconv.Itoa(i), ";"))))))
+                bindings = append(bindings, bindLine)
+            }
+        }
+        return cond, bindings
+    }
+    if pat.kind == ast.PK_IDENT {
+        id := pat.identName
+        if str.Equal(id, "_") {
+            return "true", bindings
+        }
+        // If id contains `.` (e.g. Color.Red), compare directly or via matchVariant
+        if str.Contains(id, ".") {
+            dot := str.IndexOf(id, ".")
+            enumPart := str.Substr(id, 0, dot)
+            varPart := str.Substr(id, dot + 1, str.Len(id) - dot - 1)
+            enumKey := resolveEnumKey(t, enumPart)
+            if str.Len(t.knownEnums[enumKey].enumName) > 0 {
+                enumJS := str.Concat(SanitizeJSIdent(enumKey), str.Concat(".", varPart))
+                return str.Concat("(", str.Concat(subjVar, str.Concat(" === ", str.Concat(enumJS, str.Concat(" || __skink.matchVariant(", str.Concat(subjVar, str.Concat(", ", str.Concat(escapeJSString(varPart), "))")))))))), bindings
+            }
+        }
+        // Check if id is a known constant
+        if t.knownConsts[id] {
+            return str.Concat(subjVar, str.Concat(" === ", resolveIdentJS(t, id))), bindings
+        }
+        // Check if id is a variant of any known enum
+        resolvedId := resolveIdentJS(t, id)
+        leftCond := str.Concat("(__skink.matchVariant(", str.Concat(subjVar, str.Concat(", ", str.Concat(escapeJSString(id), ")"))))
+        rightCond := str.Concat(" || ", str.Concat(subjVar, str.Concat(" === ", str.Concat(resolvedId, ")"))))
+        return str.Concat(leftCond, rightCond), bindings
+    }
+    return "true", bindings
+}
+
+// emitMatchExpr lowers a match expression (`match x { pat => expr, ... }`) into an IIFE.
+fn emitMatchExpr(t: *Transpiler, e: ast.Expr) -> string {
+    subjJS := "null"
+    if len(e.matchExprSubject) > 0 {
+        subjJS = emitExpr(t, e.matchExprSubject[0])
+    }
+    subjVar := nextTemp(t, "match")
+    sb := str.NewBuilder(256)
+    str.Write(&sb, str.Concat("(() => { const ", str.Concat(subjVar, str.Concat(" = ", str.Concat(subjJS, "; ")))))
+    for i := 0; i < len(e.matchExprArms); i = i + 1 {
+        arm := e.matchExprArms[i]
+        cond, bindings := buildPatternCondition(t, arm.pattern, subjVar)
+        if len(arm.guard) > 0 {
+            cond = str.Concat("(", str.Concat(cond, str.Concat(") && (", str.Concat(emitExpr(t, arm.guard[0]), ")"))))
+        }
+        str.Write(&sb, str.Concat("if (", str.Concat(cond, ") { ")))
+        for b := 0; b < len(bindings); b = b + 1 {
+            str.Write(&sb, str.Concat(bindings[b], " "))
+        }
+        if len(arm.body) == 1 && arm.body[0].kind == ast.ST_EXPR && len(arm.body[0].expr) > 0 {
+            str.Write(&sb, str.Concat("return ", str.Concat(emitExpr(t, arm.body[0].expr[0]), "; ")))
+        } else {
+            for s := 0; s < len(arm.body); s = s + 1 {
+                st := arm.body[s]
+                if st.kind == ast.ST_EXPR && s == len(arm.body) - 1 && len(st.expr) > 0 {
+                    str.Write(&sb, str.Concat("return ", str.Concat(emitExpr(t, st.expr[0]), "; ")))
+                } else if st.kind == ast.ST_RETURN && len(st.returnValues) > 0 {
+                    str.Write(&sb, str.Concat("return ", str.Concat(emitExpr(t, st.returnValues[0]), "; ")))
+                }
+            }
+        }
+        str.Write(&sb, "} ")
+    }
+    str.Write(&sb, "return null; })()")
+    res := str.String(sb)
+    str.Free(&sb)
+    return res
+}
+
+// emitFnLit lowers an anonymous function / closure expression `fn(params) -> Ret { body }`.
+fn emitFnLit(t: *Transpiler, e: ast.Expr) -> string {
+    var paramNames []string
+    for i := 0; i < len(e.fnLitParams); i = i + 1 {
+        paramNames = append(paramNames, SanitizeJSIdent(e.fnLitParams[i].name))
+    }
+    paramsStr := str.Join(paramNames, ", ")
+
+    // Save current builder and emit body into a sub-builder
+    savedOut := t.out
+    savedIndent := t.indentLevel
+    t.out = str.NewBuilder(256)
+    t.indentLevel = savedIndent + 1
+    for i := 0; i < len(e.fnLitBody); i = i + 1 {
+        emitStmt(t, e.fnLitBody[i])
+    }
+    bodyJS := str.String(t.out)
+    str.Free(&t.out)
+    t.out = savedOut
+    t.indentLevel = savedIndent
+
+    sb := str.NewBuilder(str.Len(bodyJS) + 64)
+    str.Write(&sb, str.Concat("(", str.Concat(paramsStr, ") => {\n")))
+    str.Write(&sb, bodyJS)
+    for i := 0; i < savedIndent; i = i + 1 {
+        str.Write(&sb, "  ")
+    }
+    str.Write(&sb, "}")
+    res := str.String(sb)
+    str.Free(&sb)
+    return res
+}
+
+// emitExpr lowers any `ast.Expr` node into a JavaScript expression string.
+fn emitExpr(t: *Transpiler, e: ast.Expr) -> string {
+    if e.kind == ast.EX_IDENT {
+        return resolveIdentJS(t, e.ident)
+    }
+    if e.kind == ast.EX_INT {
+        if str.Len(e.strVal) > 0 {
+            return e.strVal
+        }
+        return strconv.Itoa(e.intVal)
+    }
+    if e.kind == ast.EX_FLOAT {
+        if str.Len(e.strVal) > 0 {
+            return e.strVal
+        }
+        return fmt.Ftoa(e.floatVal)
+    }
+    if e.kind == ast.EX_STRING {
+        return escapeJSString(e.strVal)
+    }
+    if e.kind == ast.EX_BOOL {
+        if e.boolVal {
+            return "true"
+        }
+        return "false"
+    }
+    if e.kind == ast.EX_NIL {
+        return "null"
+    }
+    if e.kind == ast.EX_INTERP {
+        sb := str.NewBuilder(128)
+        str.Write(&sb, "`")
+        for i := 0; i < len(e.interpParts); i = i + 1 {
+            part := e.interpParts[i]
+            if part.isExpr && len(part.expr) > 0 {
+                str.Write(&sb, str.Concat("${__skink.formatVal(", str.Concat(emitExpr(t, part.expr[0]), ")}")))
+            } else {
+                str.Write(&sb, escapeTemplatePart(part.strVal))
+            }
+        }
+        str.Write(&sb, "`")
+        res := str.String(sb)
+        str.Free(&sb)
+        return res
+    }
+    if e.kind == ast.EX_PAREN {
+        if len(e.inner) > 0 {
+            return str.Concat("(", str.Concat(emitExpr(t, e.inner[0]), ")"))
+        }
+        return "()"
+    }
+    if e.kind == ast.EX_PREFIX {
+        if len(e.prefixRight) == 0 {
+            return "undefined"
+        }
+        right := e.prefixRight[0]
+        if str.Equal(e.prefixOp, "&") {
+            return emitAddressOf(t, right)
+        }
+        if str.Equal(e.prefixOp, "*") {
+            return str.Concat("__skink.deref(", str.Concat(emitExpr(t, right), ")"))
+        }
+        if str.Equal(e.prefixOp, "<-") {
+            return str.Concat(emitExpr(t, right), ".recv()")
+        }
+        return str.Concat("(", str.Concat(e.prefixOp, str.Concat(emitExpr(t, right), ")")))
+    }
+    if e.kind == ast.EX_INFIX {
+        if len(e.infixLeft) == 0 || len(e.infixRight) == 0 {
+            return "undefined"
+        }
+        left := e.infixLeft[0]
+        right := e.infixRight[0]
+        op := e.infixOp
+        if str.Equal(op, "<-") {
+            return str.Concat(emitExpr(t, left), str.Concat(".send(", str.Concat(emitExpr(t, right), ")")))
+        }
+        leftJS := emitExpr(t, left)
+        rightJS := emitExpr(t, right)
+        if str.Equal(op, "in") {
+            return str.Concat("__skink.contains(", str.Concat(rightJS, str.Concat(", ", str.Concat(leftJS, ")"))))
+        }
+        if str.Equal(op, "==") {
+            return str.Concat("(", str.Concat(leftJS, str.Concat(" === ", str.Concat(rightJS, ")"))))
+        }
+        if str.Equal(op, "!=") {
+            return str.Concat("(", str.Concat(leftJS, str.Concat(" !== ", str.Concat(rightJS, ")"))))
+        }
+        if str.Equal(op, "/") {
+            if !isFloatExpr(t, left) && !isFloatExpr(t, right) {
+                return str.Concat("Math.trunc(", str.Concat(leftJS, str.Concat(" / ", str.Concat(rightJS, ")"))))
+            }
+        }
+        return str.Concat("(", str.Concat(leftJS, str.Concat(" ", str.Concat(op, str.Concat(" ", str.Concat(rightJS, ")"))))))
+    }
+    if e.kind == ast.EX_CALL {
+        return emitCallExpr(t, e)
+    }
+    if e.kind == ast.EX_FIELD {
+        return emitFieldExpr(t, e)
+    }
+    if e.kind == ast.EX_INDEX {
+        if len(e.indexTarget) == 0 || len(e.indexExpr) == 0 {
+            return "undefined"
+        }
+        if e.indexFromEnd {
+            return str.Concat("__skink.idxFromEnd(", str.Concat(emitExpr(t, e.indexTarget[0]), str.Concat(", ", str.Concat(emitExpr(t, e.indexExpr[0]), ")"))))
+        }
+        return str.Concat("__skink.idx(", str.Concat(emitExpr(t, e.indexTarget[0]), str.Concat(", ", str.Concat(emitExpr(t, e.indexExpr[0]), ")"))))
+    }
+    if e.kind == ast.EX_FROM_END {
+        if len(e.indexTarget) == 0 || len(e.indexExpr) == 0 {
+            return "undefined"
+        }
+        return str.Concat("__skink.idxFromEnd(", str.Concat(emitExpr(t, e.indexTarget[0]), str.Concat(", ", str.Concat(emitExpr(t, e.indexExpr[0]), ")"))))
+    }
+    if e.kind == ast.EX_SLICE {
+        if len(e.sliceTarget) == 0 {
+            return "[]"
+        }
+        tJS := emitExpr(t, e.sliceTarget[0])
+        lowJS := "null"
+        highJS := "null"
+        if len(e.sliceLow) > 0 {
+            lowJS = emitExpr(t, e.sliceLow[0])
+        }
+        if len(e.sliceHigh) > 0 {
+            highJS = emitExpr(t, e.sliceHigh[0])
+        }
+        return str.Concat("__skink.slice(", str.Concat(tJS, str.Concat(", ", str.Concat(lowJS, str.Concat(", ", str.Concat(highJS, ")"))))))
+    }
+    if e.kind == ast.EX_ARRAY_LIT {
+        var elems []string
+        for i := 0; i < len(e.arrayElems); i = i + 1 {
+            elems = append(elems, emitExpr(t, e.arrayElems[i]))
+        }
+        return str.Concat("[", str.Concat(str.Join(elems, ", "), "]"))
+    }
+    if e.kind == ast.EX_MAP_LIT {
+        var entries []string
+        for i := 0; i < len(e.mapKeys); i = i + 1 {
+            kJS := emitExpr(t, e.mapKeys[i])
+            vJS := "null"
+            if i < len(e.mapVals) {
+                vJS = emitExpr(t, e.mapVals[i])
+            }
+            entries = append(entries, str.Concat("[", str.Concat(kJS, str.Concat("]: ", vJS))))
+        }
+        if len(entries) == 0 {
+            return "{}"
+        }
+        return str.Concat("{ ", str.Concat(str.Join(entries, ", "), " }"))
+    }
+    if e.kind == ast.EX_SET_LIT {
+        var elems []string
+        for i := 0; i < len(e.setElems); i = i + 1 {
+            elems = append(elems, emitExpr(t, e.setElems[i]))
+        }
+        return str.Concat("new Set([", str.Concat(str.Join(elems, ", "), "])"))
+    }
+    if e.kind == ast.EX_STRUCT_LIT {
+        return emitStructLit(t, e)
+    }
+    if e.kind == ast.EX_FN_LIT {
+        return emitFnLit(t, e)
+    }
+    if e.kind == ast.EX_IF_EXPR {
+        cJS := "false"
+        if len(e.ifCond) > 0 {
+            cJS = emitExpr(t, e.ifCond[0])
+        }
+        thJS := "null"
+        if len(e.ifThen) > 0 {
+            thJS = emitExpr(t, e.ifThen[0])
+        }
+        elJS := "null"
+        if len(e.ifElse) > 0 {
+            elJS = emitExpr(t, e.ifElse[0])
+        }
+        return str.Concat("(", str.Concat(cJS, str.Concat(" ? ", str.Concat(thJS, str.Concat(" : ", str.Concat(elJS, ")"))))))
+    }
+    if e.kind == ast.EX_MATCH_EXPR {
+        return emitMatchExpr(t, e)
+    }
+    if e.kind == ast.EX_MAKE {
+        return emitMakeExpr(t, e)
+    }
+    if e.kind == ast.EX_SIZEOF {
+        if len(e.sizeofType) > 0 {
+            return strconv.Itoa(sizeofASTType(t, e.sizeofType[0]))
+        }
+        return "8"
+    }
+    if e.kind == ast.EX_ALIGNOF {
+        if len(e.sizeofType) > 0 {
+            return strconv.Itoa(alignofASTType(t, e.sizeofType[0]))
+        }
+        return "8"
+    }
+    if e.kind == ast.EX_RANGE {
+        lowJS := "0"
+        if len(e.rangeLow) > 0 {
+            lowJS = emitExpr(t, e.rangeLow[0])
+        }
+        highJS := "0"
+        if len(e.rangeHigh) > 0 {
+            highJS = emitExpr(t, e.rangeHigh[0])
+        }
+        return str.Concat("[", str.Concat(lowJS, str.Concat(", ", str.Concat(highJS, "]"))))
+    }
+    if e.kind == ast.EX_SPREAD {
+        if len(e.spreadExpr) > 0 {
+            return str.Concat("...", emitExpr(t, e.spreadExpr[0]))
+        }
+        return ""
+    }
+    if e.kind == ast.EX_ERROR_PROP {
+        t.currentFnHasErrProp = true
+        if len(e.postfixTarget) > 0 {
+            return str.Concat("__skink.checkErrProp(", str.Concat(emitExpr(t, e.postfixTarget[0]), ")"))
+        }
+        return "undefined"
+    }
+    if e.kind == ast.EX_NONNULL {
+        if len(e.postfixTarget) > 0 {
+            return str.Concat("__skink.nonNull(", str.Concat(emitExpr(t, e.postfixTarget[0]), ")"))
+        }
+        return "null"
+    }
+    if e.kind == ast.EX_ASYNC {
+        if len(e.inner) > 0 {
+            return str.Concat("__skink.asyncCall(() => ", str.Concat(emitExpr(t, e.inner[0]), ")"))
+        }
+        if len(e.awaitExpr) > 0 {
+            return str.Concat("__skink.asyncCall(() => ", str.Concat(emitExpr(t, e.awaitExpr[0]), ")"))
+        }
+        return "null"
+    }
+    if e.kind == ast.EX_AWAIT {
+        if len(e.awaitExpr) > 0 {
+            return str.Concat("__skink.awaitVal(", str.Concat(emitExpr(t, e.awaitExpr[0]), ")"))
+        }
+        return "null"
+    }
+    if e.kind == ast.EX_TUPLE {
+        var elems []string
+        for i := 0; i < len(e.tupleElems); i = i + 1 {
+            elems = append(elems, emitExpr(t, e.tupleElems[i]))
+        }
+        return str.Concat("[", str.Concat(str.Join(elems, ", "), "]"))
+    }
+    return "null"
+}
+
+// stmtInlineJS formats a simple statement (for-init or for-post) without trailing newline.
+fn stmtInlineJS(t: *Transpiler, stmt: ast.Stmt) -> string {
+    if stmt.kind == ast.ST_VAR {
+        vName := SanitizeJSIdent(stmt.varName)
+        if len(stmt.varType) > 0 && isFloatASTType(stmt.varType[0]) {
+            t.localIsFloat[stmt.varName] = true
+        } else if len(stmt.varValue) > 0 && isFloatExpr(t, stmt.varValue[0]) {
+            t.localIsFloat[stmt.varName] = true
+        }
+        valJS := "null"
+        if len(stmt.varValue) > 0 {
+            valJS = emitExpr(t, stmt.varValue[0])
+        } else if len(stmt.varType) > 0 {
+            valJS = defaultValueForType(t, stmt.varType[0])
+        }
+        return str.Concat("let ", str.Concat(vName, str.Concat(" = ", valJS)))
+    }
+    if stmt.kind == ast.ST_ASSIGN && len(stmt.assignTarget) > 0 && len(stmt.assignValue) > 0 {
+        target := stmt.assignTarget[0]
+        valJS := emitExpr(t, stmt.assignValue[0])
+        if target.kind == ast.EX_PREFIX && str.Equal(target.prefixOp, "*") && len(target.prefixRight) > 0 {
+            ptrJS := emitExpr(t, target.prefixRight[0])
+            return str.Concat("__skink.setRef(", str.Concat(ptrJS, str.Concat(", ", str.Concat(valJS, ")"))))
+        }
+        if target.kind == ast.EX_INDEX && len(target.indexTarget) > 0 && len(target.indexExpr) > 0 {
+            arrJS := emitExpr(t, target.indexTarget[0])
+            idxJS := emitExpr(t, target.indexExpr[0])
+            if target.indexFromEnd {
+                return str.Concat("__skink.setIdx(", str.Concat(arrJS, str.Concat(", ", str.Concat(idxJS, str.Concat(", ", str.Concat(valJS, ", true)"))))))
+            }
+            return str.Concat(arrJS, str.Concat("[", str.Concat(idxJS, str.Concat("] ", str.Concat(stmt.assignOp, str.Concat(" ", valJS))))))
+        }
+        if target.kind == ast.EX_FROM_END && len(target.indexTarget) > 0 && len(target.indexExpr) > 0 {
+            arrJS := emitExpr(t, target.indexTarget[0])
+            idxJS := emitExpr(t, target.indexExpr[0])
+            return str.Concat("__skink.setIdx(", str.Concat(arrJS, str.Concat(", ", str.Concat(idxJS, str.Concat(", ", str.Concat(valJS, ", true)"))))))
+        }
+        if target.kind == ast.EX_IDENT && str.Equal(target.ident, "_") {
+            return valJS
+        }
+        return str.Concat(emitExpr(t, target), str.Concat(" ", str.Concat(stmt.assignOp, str.Concat(" ", valJS))))
+    }
+    if stmt.kind == ast.ST_EXPR && len(stmt.expr) > 0 {
+        return emitExpr(t, stmt.expr[0])
+    }
+    return ""
+}
+
+// containsDeferStmt recursively checks whether any statement in stmts is an ST_DEFER.
+fn containsDeferStmt(stmts: []ast.Stmt) -> bool {
+    for i := 0; i < len(stmts); i = i + 1 {
+        s := stmts[i]
+        if s.kind == ast.ST_DEFER {
+            return true
+        }
+        if containsDeferStmt(s.thenBody) || containsDeferStmt(s.elseBody) {
+            return true
+        }
+        for c := 0; c < len(s.selectCases); c = c + 1 {
+            if containsDeferStmt(s.selectCases[c].body) {
+                return true
+            }
+        }
+        for m := 0; m < len(s.matchArms); m = m + 1 {
+            if containsDeferStmt(s.matchArms[m].body) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// emitStmt lowers an `ast.Stmt` inside a function or block body.
+fn emitStmt(t: *Transpiler, stmt: ast.Stmt) {
+    if stmt.kind == ast.ST_VAR || stmt.kind == ast.ST_VARDECL {
+        // Multi-variable short declaration: `a, b := expr`
+        if len(stmt.varNames) > 1 {
+            var bindings []string
+            for i := 0; i < len(stmt.varNames); i = i + 1 {
+                nm := stmt.varNames[i]
+                if str.Equal(nm, "_") {
+                    bindings = append(bindings, "")
+                } else {
+                    bindings = append(bindings, SanitizeJSIdent(nm))
+                }
+            }
+            rhsJS := "[]"
+            if len(stmt.varValue) == 1 {
+                valExpr := stmt.varValue[0]
+                // Check for `v, ok := <-ch` channel receive
+                if valExpr.kind == ast.EX_PREFIX && str.Equal(valExpr.prefixOp, "<-") && len(valExpr.prefixRight) > 0 {
+                    rhsJS = str.Concat(emitExpr(t, valExpr.prefixRight[0]), ".recvOk()")
+                } else {
+                    rhsJS = emitExpr(t, valExpr)
+                }
+            } else if len(stmt.varValue) > 1 {
+                var rparts []string
+                for i := 0; i < len(stmt.varValue); i = i + 1 {
+                    rparts = append(rparts, emitExpr(t, stmt.varValue[i]))
+                }
+                rhsJS = str.Concat("[", str.Concat(str.Join(rparts, ", "), "]"))
+            }
+            emitMappedLine(t, stmt.line, stmt.col, str.Concat("let [", str.Concat(str.Join(bindings, ", "), str.Concat("] = ", str.Concat(rhsJS, ";")))))
+            return
+        }
+        inline := stmtInlineJS(t, stmt)
+        emitMappedLine(t, stmt.line, stmt.col, str.Concat(inline, ";"))
+        return
+    }
+
+    if stmt.kind == ast.ST_CONST {
+        d := stmt.decl
+        if str.Len(d.constName) > 0 && len(d.constValue) > 0 {
+            cName := SanitizeJSIdent(d.constName)
+            emitMappedLine(t, stmt.line, stmt.col, str.Concat("const ", str.Concat(cName, str.Concat(" = ", str.Concat(emitExpr(t, d.constValue[0]), ";")))))
+        }
+        for i := 0; i < len(d.constBlock); i = i + 1 {
+            item := d.constBlock[i]
+            if len(item.value) > 0 {
+                emitMappedLine(t, stmt.line, stmt.col, str.Concat("const ", str.Concat(SanitizeJSIdent(item.name), str.Concat(" = ", str.Concat(emitExpr(t, item.value[0]), ";")))))
+            }
+        }
+        return
+    }
+
+    if stmt.kind == ast.ST_ASSIGN {
+        inline := stmtInlineJS(t, stmt)
+        emitMappedLine(t, stmt.line, stmt.col, str.Concat(inline, ";"))
+        return
+    }
+
+    if stmt.kind == ast.ST_TUPLEASSIGN {
+        var lhsParts []string
+        for i := 0; i < len(stmt.tupleTargets); i = i + 1 {
+            tgt := stmt.tupleTargets[i]
+            if tgt.kind == ast.EX_IDENT && str.Equal(tgt.ident, "_") {
+                lhsParts = append(lhsParts, "")
+            } else {
+                lhsParts = append(lhsParts, emitExpr(t, tgt))
+            }
+        }
+        rhsJS := "[]"
+        if len(stmt.returnValues) == 1 {
+            rhsJS = emitExpr(t, stmt.returnValues[0])
+        } else if len(stmt.returnValues) > 1 {
+            var rhsParts []string
+            for i := 0; i < len(stmt.returnValues); i = i + 1 {
+                rhsParts = append(rhsParts, emitExpr(t, stmt.returnValues[i]))
+            }
+            rhsJS = str.Concat("[", str.Concat(str.Join(rhsParts, ", "), "]"))
+        }
+        emitMappedLine(t, stmt.line, stmt.col, str.Concat("[", str.Concat(str.Join(lhsParts, ", "), str.Concat("] = ", str.Concat(rhsJS, ";")))))
+        return
+    }
+
+    if stmt.kind == ast.ST_RETURN {
+        if len(stmt.returnValues) == 0 {
+            if len(t.currentFnRetNames) == 1 {
+                emitMappedLine(t, stmt.line, stmt.col, str.Concat("return ", str.Concat(SanitizeJSIdent(t.currentFnRetNames[0]), ";")))
+                return
+            }
+            if len(t.currentFnRetNames) > 1 {
+                var rnames []string
+                for i := 0; i < len(t.currentFnRetNames); i = i + 1 {
+                    rnames = append(rnames, SanitizeJSIdent(t.currentFnRetNames[i]))
+                }
+                emitMappedLine(t, stmt.line, stmt.col, str.Concat("return [", str.Concat(str.Join(rnames, ", "), "];")))
+                return
+            }
+            emitMappedLine(t, stmt.line, stmt.col, "return;")
+            return
+        }
+        if len(stmt.returnValues) == 1 {
+            emitMappedLine(t, stmt.line, stmt.col, str.Concat("return ", str.Concat(emitExpr(t, stmt.returnValues[0]), ";")))
+            return
+        }
+        var vals []string
+        for i := 0; i < len(stmt.returnValues); i = i + 1 {
+            vals = append(vals, emitExpr(t, stmt.returnValues[i]))
+        }
+        emitMappedLine(t, stmt.line, stmt.col, str.Concat("return [", str.Concat(str.Join(vals, ", "), "];")))
+        return
+    }
+
+    if stmt.kind == ast.ST_BREAK {
+        emitMappedLine(t, stmt.line, stmt.col, "break;")
+        return
+    }
+
+    if stmt.kind == ast.ST_CONTINUE {
+        emitMappedLine(t, stmt.line, stmt.col, "continue;")
+        return
+    }
+
+    if stmt.kind == ast.ST_BLOCK {
+        emitLine(t, "{")
+        t.indentLevel = t.indentLevel + 1
+        for i := 0; i < len(stmt.thenBody); i = i + 1 {
+            emitStmt(t, stmt.thenBody[i])
+        }
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "}")
+        return
+    }
+
+    if stmt.kind == ast.ST_IF {
+        hasInit := len(stmt.ifInit) > 0
+        if hasInit {
+            emitLine(t, "{")
+            t.indentLevel = t.indentLevel + 1
+            emitStmt(t, stmt.ifInit[0])
+        }
+        condJS := "true"
+        if len(stmt.cond) > 0 {
+            condJS = emitExpr(t, stmt.cond[0])
+        }
+        emitMappedLine(t, stmt.line, stmt.col, str.Concat("if (", str.Concat(condJS, ") {")))
+        t.indentLevel = t.indentLevel + 1
+        for i := 0; i < len(stmt.thenBody); i = i + 1 {
+            emitStmt(t, stmt.thenBody[i])
+        }
+        t.indentLevel = t.indentLevel - 1
+        if len(stmt.elseBody) > 0 {
+            emitLine(t, "} else {")
+            t.indentLevel = t.indentLevel + 1
+            for i := 0; i < len(stmt.elseBody); i = i + 1 {
+                emitStmt(t, stmt.elseBody[i])
+            }
+            t.indentLevel = t.indentLevel - 1
+        }
+        emitLine(t, "}")
+        if hasInit {
+            t.indentLevel = t.indentLevel - 1
+            emitLine(t, "}")
+        }
+        return
+    }
+
+    if stmt.kind == ast.ST_WHILE {
+        condJS := "true"
+        if len(stmt.cond) > 0 {
+            condJS = emitExpr(t, stmt.cond[0])
+        }
+        emitMappedLine(t, stmt.line, stmt.col, str.Concat("while (", str.Concat(condJS, ") {")))
+        t.indentLevel = t.indentLevel + 1
+        for i := 0; i < len(stmt.thenBody); i = i + 1 {
+            emitStmt(t, stmt.thenBody[i])
+        }
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "}")
+        return
+    }
+
+    if stmt.kind == ast.ST_UNTIL {
+        condJS := "false"
+        if len(stmt.cond) > 0 {
+            condJS = emitExpr(t, stmt.cond[0])
+        }
+        emitMappedLine(t, stmt.line, stmt.col, str.Concat("while (!(", str.Concat(condJS, ")) {")))
+        t.indentLevel = t.indentLevel + 1
+        for i := 0; i < len(stmt.thenBody); i = i + 1 {
+            emitStmt(t, stmt.thenBody[i])
+        }
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "}")
+        return
+    }
+
+    if stmt.kind == ast.ST_FOR {
+        // 1. For-in range or collection loop
+        if str.Len(stmt.forIterVar) > 0 && len(stmt.forIterExpr) > 0 {
+            iterExpr := stmt.forIterExpr[0]
+            v1 := SanitizeJSIdent(stmt.forIterVar)
+            if iterExpr.kind == ast.EX_RANGE && len(iterExpr.rangeLow) > 0 && len(iterExpr.rangeHigh) > 0 {
+                lowJS := emitExpr(t, iterExpr.rangeLow[0])
+                highJS := emitExpr(t, iterExpr.rangeHigh[0])
+                emitMappedLine(t, stmt.line, stmt.col, str.Concat("for (let ", str.Concat(v1, str.Concat(" = ", str.Concat(lowJS, str.Concat("; ", str.Concat(v1, str.Concat(" < ", str.Concat(highJS, str.Concat("; ", str.Concat(v1, "++) {")))))))))))
+                t.indentLevel = t.indentLevel + 1
+                for i := 0; i < len(stmt.thenBody); i = i + 1 {
+                    emitStmt(t, stmt.thenBody[i])
+                }
+                t.indentLevel = t.indentLevel - 1
+                emitLine(t, "}")
+                return
+            }
+            colJS := emitExpr(t, iterExpr)
+            colTmp := nextTemp(t, "col")
+            emitMappedLine(t, stmt.line, stmt.col, str.Concat("const ", str.Concat(colTmp, str.Concat(" = ", str.Concat(colJS, ";")))))
+            if str.Len(stmt.forIterVar2) > 0 {
+                v2 := SanitizeJSIdent(stmt.forIterVar2)
+                kvTmp := nextTemp(t, "kv")
+                iterSource := str.Concat("(Array.isArray(", str.Concat(colTmp, str.Concat(") ? ", str.Concat(colTmp, str.Concat(".entries() : (typeof ", str.Concat(colTmp, str.Concat(" === \"string\" ? Array.from(", str.Concat(colTmp, str.Concat(").map((c, idx) => [idx, c.charCodeAt(0)]) : Object.entries(", str.Concat(colTmp, " || {})))"))))))))))
+                emitLine(t, str.Concat("for (const ", str.Concat(kvTmp, str.Concat(" of ", str.Concat(iterSource, ") {")))))
+                t.indentLevel = t.indentLevel + 1
+                if !str.Equal(stmt.forIterVar, "_") {
+                    emitLine(t, str.Concat("let ", str.Concat(v1, str.Concat(" = typeof ", str.Concat(kvTmp, str.Concat("[0] === \"number\" ? ", str.Concat(kvTmp, str.Concat("[0] : (/^-?\\d+$/.test(", str.Concat(kvTmp, str.Concat("[0]) ? Number(", str.Concat(kvTmp, str.Concat("[0]) : ", str.Concat(kvTmp, "[0]);")))))))))))))
+                }
+                if !str.Equal(stmt.forIterVar2, "_") {
+                    emitLine(t, str.Concat("let ", str.Concat(v2, str.Concat(" = ", str.Concat(kvTmp, "[1];")))))
+                }
+                for i := 0; i < len(stmt.thenBody); i = i + 1 {
+                    emitStmt(t, stmt.thenBody[i])
+                }
+                t.indentLevel = t.indentLevel - 1
+                emitLine(t, "}")
+                return
+            } else {
+                iterSource := str.Concat("(Array.isArray(", str.Concat(colTmp, str.Concat(") || (", str.Concat(colTmp, str.Concat(" instanceof Set) ? ", str.Concat(colTmp, str.Concat(" : (typeof ", str.Concat(colTmp, str.Concat(" === \"string\" ? Array.from(", str.Concat(colTmp, str.Concat(").map(c => c.charCodeAt(0)) : Object.keys(", str.Concat(colTmp, " || {})))"))))))))))))
+                emitLine(t, str.Concat("for (let ", str.Concat(v1, str.Concat(" of ", str.Concat(iterSource, ") {")))))
+                t.indentLevel = t.indentLevel + 1
+                for i := 0; i < len(stmt.thenBody); i = i + 1 {
+                    emitStmt(t, stmt.thenBody[i])
+                }
+                t.indentLevel = t.indentLevel - 1
+                emitLine(t, "}")
+                return
+            }
+        }
+        // 2. C-style for loop `for init; cond; post { ... }`
+        if len(stmt.forInit) > 0 || len(stmt.forPost) > 0 {
+            initJS := ""
+            if len(stmt.forInit) > 0 {
+                initJS = stmtInlineJS(t, stmt.forInit[0])
+            }
+            condJS := "true"
+            if len(stmt.cond) > 0 {
+                condJS = emitExpr(t, stmt.cond[0])
+            }
+            postJS := ""
+            if len(stmt.forPost) > 0 {
+                postJS = stmtInlineJS(t, stmt.forPost[0])
+            }
+            emitMappedLine(t, stmt.line, stmt.col, str.Concat("for (", str.Concat(initJS, str.Concat("; ", str.Concat(condJS, str.Concat("; ", str.Concat(postJS, ") {")))))))
+            t.indentLevel = t.indentLevel + 1
+            for i := 0; i < len(stmt.thenBody); i = i + 1 {
+                emitStmt(t, stmt.thenBody[i])
+            }
+            t.indentLevel = t.indentLevel - 1
+            emitLine(t, "}")
+            return
+        }
+        // 3. Condition-only or infinite for loop
+        condJS := "true"
+        if len(stmt.cond) > 0 {
+            condJS = emitExpr(t, stmt.cond[0])
+        }
+        emitMappedLine(t, stmt.line, stmt.col, str.Concat("while (", str.Concat(condJS, ") {")))
+        t.indentLevel = t.indentLevel + 1
+        for i := 0; i < len(stmt.thenBody); i = i + 1 {
+            emitStmt(t, stmt.thenBody[i])
+        }
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "}")
+        return
+    }
+
+    if stmt.kind == ast.ST_MATCH {
+        subjJS := "true"
+        if len(stmt.matchSubject) > 0 {
+            subjJS = emitExpr(t, stmt.matchSubject[0])
+        }
+        subjVar := nextTemp(t, "match")
+        emitMappedLine(t, stmt.line, stmt.col, str.Concat("const ", str.Concat(subjVar, str.Concat(" = ", str.Concat(subjJS, ";")))))
+        for i := 0; i < len(stmt.matchArms); i = i + 1 {
+            arm := stmt.matchArms[i]
+            cond, bindings := buildPatternCondition(t, arm.pattern, subjVar)
+            if len(arm.guard) > 0 {
+                cond = str.Concat("(", str.Concat(cond, str.Concat(") && (", str.Concat(emitExpr(t, arm.guard[0]), ")"))))
+            }
+            prefix := "} else if ("
+            if i == 0 {
+                prefix = "if ("
+            }
+            emitLine(t, str.Concat(prefix, str.Concat(cond, ") {")))
+            t.indentLevel = t.indentLevel + 1
+            for b := 0; b < len(bindings); b = b + 1 {
+                emitLine(t, bindings[b])
+            }
+            for s := 0; s < len(arm.body); s = s + 1 {
+                emitStmt(t, arm.body[s])
+            }
+            t.indentLevel = t.indentLevel - 1
+        }
+        if len(stmt.matchArms) > 0 {
+            emitLine(t, "}")
+        }
+        return
+    }
+
+    if stmt.kind == ast.ST_SWITCH {
+        if len(stmt.cond) > 0 {
+            condJS := emitExpr(t, stmt.cond[0])
+            emitMappedLine(t, stmt.line, stmt.col, str.Concat("switch (", str.Concat(condJS, ") {")))
+            t.indentLevel = t.indentLevel + 1
+            for i := 0; i < len(stmt.selectCases); i = i + 1 {
+                sc := stmt.selectCases[i]
+                if sc.isDefault {
+                    emitLine(t, "default: {")
+                } else if len(sc.cond) > 0 {
+                    emitLine(t, str.Concat("case ", str.Concat(emitExpr(t, sc.cond[0]), ": {")))
+                } else {
+                    emitLine(t, "default: {")
+                }
+                t.indentLevel = t.indentLevel + 1
+                for s := 0; s < len(sc.body); s = s + 1 {
+                    emitStmt(t, sc.body[s])
+                }
+                emitLine(t, "break;")
+                t.indentLevel = t.indentLevel - 1
+                emitLine(t, "}")
+            }
+            t.indentLevel = t.indentLevel - 1
+            emitLine(t, "}")
+        } else {
+            // Conditionless switch (`switch { case a > b: ... }`)
+            for i := 0; i < len(stmt.selectCases); i = i + 1 {
+                sc := stmt.selectCases[i]
+                if sc.isDefault || len(sc.cond) == 0 {
+                    if i == 0 {
+                        emitLine(t, "if (true) {")
+                    } else {
+                        emitLine(t, "} else {")
+                    }
+                } else {
+                    prefix := "} else if ("
+                    if i == 0 {
+                        prefix = "if ("
+                    }
+                    emitLine(t, str.Concat(prefix, str.Concat(emitExpr(t, sc.cond[0]), ") {")))
+                }
+                t.indentLevel = t.indentLevel + 1
+                for s := 0; s < len(sc.body); s = s + 1 {
+                    emitStmt(t, sc.body[s])
+                }
+                t.indentLevel = t.indentLevel - 1
+            }
+            if len(stmt.selectCases) > 0 {
+                emitLine(t, "}")
+            }
+        }
+        return
+    }
+
+    if stmt.kind == ast.ST_SELECT {
+        for i := 0; i < len(stmt.selectCases); i = i + 1 {
+            sc := stmt.selectCases[i]
+            prefix := "} else if ("
+            if i == 0 {
+                prefix = "if ("
+            }
+            if sc.isDefault {
+                if i == 0 {
+                    emitLine(t, "if (true) {")
+                } else {
+                    emitLine(t, "} else {")
+                }
+            } else if len(sc.cond) > 0 {
+                ce := sc.cond[0]
+                if ce.kind == ast.EX_PREFIX && str.Equal(ce.prefixOp, "<-") && len(ce.prefixRight) > 0 {
+                    chJS := emitExpr(t, ce.prefixRight[0])
+                    emitLine(t, str.Concat(prefix, str.Concat(chJS, ".hasData()) {")))
+                    t.indentLevel = t.indentLevel + 1
+                    if str.Len(sc.recvVar) > 0 && !str.Equal(sc.recvVar, "_") {
+                        emitLine(t, str.Concat("let ", str.Concat(SanitizeJSIdent(sc.recvVar), str.Concat(" = ", str.Concat(chJS, ".recv();")))))
+                    } else {
+                        emitLine(t, str.Concat(chJS, ".recv();"))
+                    }
+                    for s := 0; s < len(sc.body); s = s + 1 {
+                        emitStmt(t, sc.body[s])
+                    }
+                    t.indentLevel = t.indentLevel - 1
+                    continue
+                } else if ce.kind == ast.EX_INFIX && str.Equal(ce.infixOp, "<-") && len(ce.infixLeft) > 0 && len(ce.infixRight) > 0 {
+                    emitLine(t, str.Concat(prefix, "true) {"))
+                    t.indentLevel = t.indentLevel + 1
+                    emitLine(t, str.Concat(emitExpr(t, ce), ";"))
+                    for s := 0; s < len(sc.body); s = s + 1 {
+                        emitStmt(t, sc.body[s])
+                    }
+                    t.indentLevel = t.indentLevel - 1
+                    continue
+                } else {
+                    emitLine(t, str.Concat(prefix, str.Concat(emitExpr(t, ce), ") {")))
+                }
+            } else {
+                emitLine(t, str.Concat(prefix, "true) {"))
+            }
+            t.indentLevel = t.indentLevel + 1
+            for s := 0; s < len(sc.body); s = s + 1 {
+                emitStmt(t, sc.body[s])
+            }
+            t.indentLevel = t.indentLevel - 1
+        }
+        if len(stmt.selectCases) > 0 {
+            emitLine(t, "}")
+        }
+        return
+    }
+
+    if stmt.kind == ast.ST_DEFER {
+        if len(stmt.deferStmt) > 0 {
+            emitMappedLine(t, stmt.line, stmt.col, "__defers.push(() => {")
+            t.indentLevel = t.indentLevel + 1
+            emitStmt(t, stmt.deferStmt[0])
+            t.indentLevel = t.indentLevel - 1
+            emitLine(t, "});")
+        }
+        return
+    }
+
+    if stmt.kind == ast.ST_SPAWN {
+        if len(stmt.spawnCall) > 0 {
+            emitMappedLine(t, stmt.line, stmt.col, str.Concat("__skink.spawnTask(() => { ", str.Concat(emitExpr(t, stmt.spawnCall[0]), "; });")))
+        }
+        return
+    }
+
+    if stmt.kind == ast.ST_EXPR {
+        if len(stmt.expr) > 0 {
+            emitMappedLine(t, stmt.line, stmt.col, str.Concat(emitExpr(t, stmt.expr[0]), ";"))
+        }
+        return
+    }
+}
+
+// recordExport records a symbol for module exports if it belongs to the entry module (in bundle mode)
+// or any user module (in multi-file mode).
+fn recordExport(t: *Transpiler, publicName: string, jsName: string, isPub: bool) {
+    if t.multiFileMode {
+        t.exportedSymbols = append(t.exportedSymbols, jsName)
+        t.exportedJSNames = append(t.exportedJSNames, jsName)
+        if !str.Equal(publicName, jsName) {
+            t.exportedSymbols = append(t.exportedSymbols, publicName)
+            t.exportedJSNames = append(t.exportedJSNames, jsName)
+        }
+        return
+    }
+    if isPub || str.Equal(t.currentModule, "main") {
+        t.exportedSymbols = append(t.exportedSymbols, publicName)
+        t.exportedJSNames = append(t.exportedJSNames, jsName)
+    }
+}
+
+// emitFunctionDecl lowers an `ast.ST_FN` declaration (standalone function or receiver method).
+fn emitFunctionDecl(t: *Transpiler, stmt: ast.Stmt, forcedJSName: string, prependReceiverParam: string) {
+    d := stmt.decl
+    if d.fnIsExtern {
+        return
+    }
+
+    jsFnName := forcedJSName
+    if str.Len(jsFnName) == 0 {
+        if len(d.fnReceiver) > 0 {
+            recvT := d.fnReceiver[0]
+            recvName := recvT.name
+            if recvT.kind == ast.TY_POINTER && len(recvT.elem) > 0 {
+                recvName = recvT.elem[0].name
+            }
+            if !str.Contains(recvName, ".") && !str.Equal(t.currentModule, "main") {
+                recvName = str.Concat(t.currentModule, str.Concat(".", recvName))
+            }
+            jsFnName = str.Concat(SanitizeJSIdent(recvName), str.Concat("_", SanitizeJSIdent(unqualifyName(d.fnName))))
+        } else {
+            jsFnName = SanitizeJSIdent(d.fnName)
+        }
+    }
+
+    if str.Equal(d.fnName, "main") {
+        t.hasMainFn = true
+    }
+
+    t.localIsFloat = make(map[string]bool)
+    t.localIsStruct = make(map[string]string)
+    t.currentFnRetTypes = d.fnRetTypes
+    t.currentFnRetNames = d.fnRetNames
+    t.currentFnHasDefer = containsDeferStmt(d.fnBody)
+    t.currentFnHasErrProp = false
+
+    var paramList []string
+    if str.Len(prependReceiverParam) > 0 {
+        paramList = append(paramList, SanitizeJSIdent(prependReceiverParam))
+    }
+    for i := 0; i < len(d.fnParams); i = i + 1 {
+        p := d.fnParams[i]
+        pName := SanitizeJSIdent(p.name)
+        paramList = append(paramList, pName)
+        if len(p.typ) > 0 && isFloatASTType(p.typ[0]) {
+            t.localIsFloat[p.name] = true
+        }
+    }
+
+    if t.cfg.keepComments && !t.cfg.minify {
+        emitLine(t, str.Concat("// fn ", d.fnName))
+    }
+    emitMappedLine(t, stmt.line, stmt.col, str.Concat("function ", str.Concat(jsFnName, str.Concat("(", str.Concat(str.Join(paramList, ", "), ") {")))))
+    t.indentLevel = t.indentLevel + 1
+
+    // Declare named return variables if present
+    for i := 0; i < len(d.fnRetNames); i = i + 1 {
+        rName := d.fnRetNames[i]
+        if str.Len(rName) > 0 {
+            defVal := "null"
+            if i < len(d.fnRetTypes) {
+                defVal = defaultValueForType(t, d.fnRetTypes[i])
+            }
+            emitLine(t, str.Concat("let ", str.Concat(SanitizeJSIdent(rName), str.Concat(" = ", str.Concat(defVal, ";")))))
+        }
+    }
+
+    if t.currentFnHasDefer {
+        emitLine(t, "const __defers = [];")
+        emitLine(t, "try {")
+        t.indentLevel = t.indentLevel + 1
+    }
+
+    // Emit body into a temporary builder so we know if `?` error propagation was used
+    savedOut := t.out
+    t.out = str.NewBuilder(512)
+    for i := 0; i < len(d.fnBody); i = i + 1 {
+        emitStmt(t, d.fnBody[i])
+    }
+    bodyCode := str.String(t.out)
+    str.Free(&t.out)
+    t.out = savedOut
+
+    if t.currentFnHasErrProp && !t.currentFnHasDefer {
+        emitLine(t, "try {")
+        t.indentLevel = t.indentLevel + 1
+        writeRaw(t, bodyCode)
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "} catch (__e) {")
+        t.indentLevel = t.indentLevel + 1
+        emitLine(t, "if (__e && __e.__skinkErrProp) {")
+        t.indentLevel = t.indentLevel + 1
+        if len(d.fnRetTypes) <= 1 {
+            emitLine(t, "return __e.__skinkErrProp;")
+        } else {
+            var zeroRets []string
+            for r := 0; r < len(d.fnRetTypes) - 1; r = r + 1 {
+                zeroRets = append(zeroRets, defaultValueForType(t, d.fnRetTypes[r]))
+            }
+            zeroRets = append(zeroRets, "__e.__skinkErrProp")
+            emitLine(t, str.Concat("return [", str.Concat(str.Join(zeroRets, ", "), "];")))
+        }
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "}")
+        emitLine(t, "throw __e;")
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "}")
+    } else {
+        writeRaw(t, bodyCode)
+    }
+
+    if t.currentFnHasDefer {
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "} catch (__e) {")
+        t.indentLevel = t.indentLevel + 1
+        emitLine(t, "if (__e && __e.__skinkErrProp) {")
+        t.indentLevel = t.indentLevel + 1
+        if len(d.fnRetTypes) <= 1 {
+            emitLine(t, "return __e.__skinkErrProp;")
+        } else {
+            var zeroRets []string
+            for r := 0; r < len(d.fnRetTypes) - 1; r = r + 1 {
+                zeroRets = append(zeroRets, defaultValueForType(t, d.fnRetTypes[r]))
+            }
+            zeroRets = append(zeroRets, "__e.__skinkErrProp")
+            emitLine(t, str.Concat("return [", str.Concat(str.Join(zeroRets, ", "), "];")))
+        }
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "}")
+        emitLine(t, "while (__defers.length > 0) { (__defers.pop())(); }")
+        emitLine(t, "if (__skink.hasActivePanic()) throw __e;")
+        emitLine(t, "if (!(__e && __e.__skinkPanic)) throw __e;")
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "} finally {")
+        t.indentLevel = t.indentLevel + 1
+        emitLine(t, "while (__defers.length > 0) { (__defers.pop())(); }")
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "}")
+    }
+
+    t.indentLevel = t.indentLevel - 1
+    emitLine(t, "}")
+
+    if len(d.fnReceiver) == 0 && str.Len(forcedJSName) == 0 {
+        recordExport(t, unqualifyName(d.fnName), jsFnName, d.fnIsPub)
+    }
+}
+
+// emitStructDecl lowers an `ast.ST_STRUCT` declaration into a factory `__make_<Struct>`
+// plus any inline methods.
+fn emitStructDecl(t: *Transpiler, stmt: ast.Stmt) {
+    d := stmt.decl
+    structKey := d.structName
+    jsStructName := SanitizeJSIdent(structKey)
+    makerName := str.Concat("__make_", jsStructName)
+
+    // First emit inline struct methods as standalone functions `<Struct>_<Method>`
+    for m := 0; m < len(d.structMethods); m = m + 1 {
+        md := d.structMethods[m]
+        mStmt := ast.Stmt{kind: ast.ST_FN, line: stmt.line, col: stmt.col, filePath: stmt.filePath, decl: md}
+        mJSName := str.Concat(jsStructName, str.Concat("_", SanitizeJSIdent(md.fnName)))
+        emitFunctionDecl(t, mStmt, mJSName, "")
+    }
+
+    emitMappedLine(t, stmt.line, stmt.col, str.Concat("function ", str.Concat(makerName, "(init = {}) {")))
+    t.indentLevel = t.indentLevel + 1
+    emitLine(t, "const self = {")
+    t.indentLevel = t.indentLevel + 1
+    emitLine(t, str.Concat("__type: ", str.Concat(escapeJSString(structKey), ",")))
+    for i := 0; i < len(d.structFields); i = i + 1 {
+        f := d.structFields[i]
+        fName := SanitizeJSIdent(f.name)
+        defVal := "null"
+        if len(f.typ) > 0 {
+            defVal = defaultValueForType(t, f.typ[0])
+        }
+        emitLine(t, str.Concat(fName, str.Concat(": init.", str.Concat(fName, str.Concat(" !== undefined ? init.", str.Concat(fName, str.Concat(" : ", str.Concat(defVal, ","))))))))
+    }
+    t.indentLevel = t.indentLevel - 1
+    emitLine(t, "};")
+
+    // Attach all registered methods (both inline and receiver methods) to the instance
+    allMethods := t.structMethods[structKey]
+    for m := 0; m < len(allMethods); m = m + 1 {
+        mName := SanitizeJSIdent(allMethods[m])
+        fnSym := str.Concat(jsStructName, str.Concat("_", mName))
+        emitLine(t, str.Concat("Object.defineProperty(self, ", str.Concat(escapeJSString(mName), str.Concat(", { enumerable: false, value: (...__args) => ", str.Concat(fnSym, "(self, ...__args) });")))))
+    }
+
+    emitLine(t, "return self;")
+    t.indentLevel = t.indentLevel - 1
+    emitLine(t, "}")
+    recordExport(t, unqualifyName(structKey), makerName, d.structIsPub)
+}
+
+// emitEnumDecl lowers an `ast.ST_ENUM` declaration (both simple integer enums and tagged unions).
+fn emitEnumDecl(t: *Transpiler, stmt: ast.Stmt) {
+    d := stmt.decl
+    jsEnumName := SanitizeJSIdent(d.enumName)
+
+    hasPayloads := false
+    for i := 0; i < len(d.enumVariants); i = i + 1 {
+        if len(d.enumVariants[i].payloads) > 0 {
+            hasPayloads = true
+        }
+    }
+
+    emitMappedLine(t, stmt.line, stmt.col, str.Concat("const ", str.Concat(jsEnumName, " = Object.freeze({")))
+    t.indentLevel = t.indentLevel + 1
+    for i := 0; i < len(d.enumVariants); i = i + 1 {
+        v := d.enumVariants[i]
+        vName := SanitizeJSIdent(v.name)
+        if !hasPayloads {
+            emitLine(t, str.Concat(vName, str.Concat(": ", str.Concat(strconv.Itoa(i), ","))))
+        } else {
+            if len(v.payloads) == 0 {
+                emitLine(t, str.Concat(vName, str.Concat(": Object.assign(() => __skink.makeVariant(", str.Concat(escapeJSString(d.enumName), str.Concat(", ", str.Concat(escapeJSString(v.name), str.Concat("), { __enum: ", str.Concat(escapeJSString(d.enumName), str.Concat(", __tag: ", str.Concat(escapeJSString(v.name), ", __values: [] }),"))))))))))
+            } else {
+                emitLine(t, str.Concat(vName, str.Concat(": (...__vals) => __skink.makeVariant(", str.Concat(escapeJSString(d.enumName), str.Concat(", ", str.Concat(escapeJSString(v.name), ", ...__vals),"))))))
+            }
+        }
+    }
+    t.indentLevel = t.indentLevel - 1
+    emitLine(t, "});")
+    if hasPayloads {
+        for i := 0; i < len(d.enumVariants); i = i + 1 {
+            vName := SanitizeJSIdent(d.enumVariants[i].name)
+            qualVar := vName
+            if !str.Equal(t.currentModule, "main") && str.Len(t.currentModule) > 0 {
+                qualVar = SanitizeJSIdent(str.Concat(t.currentModule, str.Concat(".", d.enumVariants[i].name)))
+            }
+            emitLine(t, str.Concat("const ", str.Concat(qualVar, str.Concat(" = ", str.Concat(jsEnumName, str.Concat(".", str.Concat(vName, ";")))))))
+        }
+    }
+    recordExport(t, unqualifyName(d.enumName), jsEnumName, d.enumIsPub)
+}
+
+// emitRulesetDecl lowers an `ast.ST_RULESET` declaration into a priority-sorted JS function.
+fn emitRulesetDecl(t: *Transpiler, stmt: ast.Stmt) {
+    d := stmt.decl
+    jsName := SanitizeJSIdent(d.rulesetName)
+
+    // Copy and sort rules by priority descending
+    var rules []ast.RuleDecl
+    for i := 0; i < len(d.rulesetRules); i = i + 1 {
+        rules = append(rules, d.rulesetRules[i])
+    }
+    for a := 0; a < len(rules); a = a + 1 {
+        for b := a + 1; b < len(rules); b = b + 1 {
+            if rules[b].rulePriority > rules[a].rulePriority {
+                tmp := rules[a]
+                rules[a] = rules[b]
+                rules[b] = tmp
+            }
+        }
+    }
+
+    emitMappedLine(t, stmt.line, stmt.col, str.Concat("const ", str.Concat(jsName, " = (() => {")))
+    t.indentLevel = t.indentLevel + 1
+    emitLine(t, "const _dynamic = [];")
+    emitLine(t, "function _evalRules() {")
+    t.indentLevel = t.indentLevel + 1
+    for i := 0; i < len(rules); i = i + 1 {
+        rDecl := rules[i]
+        condJS := "true"
+        if len(rDecl.condition) > 0 {
+            condJS = emitExpr(t, rDecl.condition[0])
+        }
+        emitLine(t, str.Concat("// rule: ", str.Concat(rDecl.name, str.Concat(" (priority ", str.Concat(strconv.Itoa(rDecl.rulePriority), ")")))))
+        emitLine(t, str.Concat("if (", str.Concat(condJS, ") {")))
+        t.indentLevel = t.indentLevel + 1
+        for s := 0; s < len(rDecl.ruleAction); s = s + 1 {
+            act := rDecl.ruleAction[s]
+            if act.kind == ast.ST_EXPR && len(act.expr) > 0 && act.expr[0].kind == ast.EX_FN_LIT {
+                emitLine(t, str.Concat("(", str.Concat(emitFnLit(t, act.expr[0]), ")();")))
+            } else {
+                emitStmt(t, act)
+            }
+        }
+        t.indentLevel = t.indentLevel - 1
+        emitLine(t, "}")
+    }
+    emitLine(t, "for (const _r of _dynamic) { if (typeof _r.Condition === \"function\" ? _r.Condition() : true) { if (typeof _r.Action === \"function\") _r.Action(); } }")
+    t.indentLevel = t.indentLevel - 1
+    emitLine(t, "}")
+    emitLine(t, "return { start() { _evalRules(); }, stop() {}, restart() { _evalRules(); }, reset() { _dynamic.length = 0; }, registerRule(r) { _dynamic.push(r); }, eval: _evalRules };")
+    t.indentLevel = t.indentLevel - 1
+    emitLine(t, "})();")
+    recordExport(t, unqualifyName(d.rulesetName), jsName, d.rulesetIsPub)
+}
+
+// emitServiceDecl lowers an `ast.ST_SERVICE` declaration into service methods and a namespace object.
+fn emitServiceDecl(t: *Transpiler, stmt: ast.Stmt) {
+    d := stmt.decl
+    svcJS := SanitizeJSIdent(d.serviceName)
+    var methodPairs []string
+    for i := 0; i < len(d.serviceMethods); i = i + 1 {
+        md := d.serviceMethods[i]
+        mName := SanitizeJSIdent(unqualifyName(md.fnName))
+        fnJS := str.Concat(svcJS, str.Concat("_", mName))
+        mStmt := ast.Stmt{kind: ast.ST_FN, line: stmt.line, col: stmt.col, filePath: stmt.filePath, decl: md}
+        emitFunctionDecl(t, mStmt, fnJS, "")
+        methodPairs = append(methodPairs, str.Concat(mName, str.Concat(": ", fnJS)))
+    }
+    emitMappedLine(t, stmt.line, stmt.col, str.Concat("const ", str.Concat(svcJS, str.Concat(" = { ", str.Concat(str.Join(methodPairs, ", "), " };")))))
+    recordExport(t, unqualifyName(d.serviceName), svcJS, d.serviceIsPub)
+}
+
+// emitTopLevelDecl dispatches a single top-level declaration statement.
+fn emitTopLevelDecl(t: *Transpiler, stmt: ast.Stmt) {
+    if stmt.kind == ast.ST_MODULE {
+        t.currentModule = stmt.decl.moduleName
+        if str.Len(t.currentModule) == 0 {
+            t.currentModule = "main"
+        }
+        setCurrentSourceFile(t, stmt.filePath)
+        t.importAliases = make(map[string]string)
+        return
+    }
+    if runtime.IsRuntimeBackedStdModule(t.currentModule) {
+        return
+    }
+    if str.Len(stmt.filePath) > 0 && !str.Equal(stmt.filePath, t.currentFile) {
+        setCurrentSourceFile(t, stmt.filePath)
+    }
+
+    if stmt.kind == ast.ST_IMPORT {
+        impPath := stmt.decl.importPath
+        shortMod := path.Base(impPath)
+        atIdx := str.IndexOf(shortMod, "@")
+        if atIdx >= 0 {
+            shortMod = str.Substr(shortMod, 0, atIdx)
+        }
+        t.importedModules[shortMod] = true
+        if str.Len(stmt.decl.importAlias) > 0 {
+            t.importAliases[stmt.decl.importAlias] = shortMod
+        } else {
+            t.importAliases[shortMod] = shortMod
+        }
+        return
+    }
+    if stmt.kind == ast.ST_EXTERN || stmt.kind == ast.ST_TEMPLATE || stmt.kind == ast.ST_TYPEALIAS {
+        return
+    }
+    if stmt.kind == ast.ST_STRUCT {
+        emitStructDecl(t, stmt)
+        writeRaw(t, "\n")
+        return
+    }
+    if stmt.kind == ast.ST_ENUM {
+        emitEnumDecl(t, stmt)
+        writeRaw(t, "\n")
+        return
+    }
+    if stmt.kind == ast.ST_CONST {
+        d := stmt.decl
+        if str.Len(d.constName) > 0 && len(d.constValue) > 0 {
+            jsName := SanitizeJSIdent(d.constName)
+            emitMappedLine(t, stmt.line, stmt.col, str.Concat("const ", str.Concat(jsName, str.Concat(" = ", str.Concat(emitExpr(t, d.constValue[0]), ";")))))
+            recordExport(t, unqualifyName(d.constName), jsName, d.constIsPub)
+        }
+        for i := 0; i < len(d.constBlock); i = i + 1 {
+            item := d.constBlock[i]
+            if len(item.value) > 0 {
+                jsName := SanitizeJSIdent(item.name)
+                emitMappedLine(t, stmt.line, stmt.col, str.Concat("const ", str.Concat(jsName, str.Concat(" = ", str.Concat(emitExpr(t, item.value[0]), ";")))))
+                recordExport(t, unqualifyName(item.name), jsName, d.constIsPub)
+            }
+        }
+        return
+    }
+    if stmt.kind == ast.ST_VARDECL {
+        jsName := SanitizeJSIdent(stmt.varName)
+        valJS := "null"
+        if len(stmt.varValue) > 0 {
+            valJS = emitExpr(t, stmt.varValue[0])
+        } else if len(stmt.varType) > 0 {
+            valJS = defaultValueForType(t, stmt.varType[0])
+        }
+        emitMappedLine(t, stmt.line, stmt.col, str.Concat("let ", str.Concat(jsName, str.Concat(" = ", str.Concat(valJS, ";")))))
+        recordExport(t, unqualifyName(stmt.varName), jsName, true)
+        return
+    }
+    if stmt.kind == ast.ST_FN {
+        emitFunctionDecl(t, stmt, "", "")
+        writeRaw(t, "\n")
+        return
+    }
+    if stmt.kind == ast.ST_RULESET {
+        emitRulesetDecl(t, stmt)
+        writeRaw(t, "\n")
+        return
+    }
+    if stmt.kind == ast.ST_SERVICE {
+        emitServiceDecl(t, stmt)
+        writeRaw(t, "\n")
+        return
+    }
+}
+
+// wrapModuleFormat wraps the generated body JS in the requested output format
+// ("esm", "cjs", "iife", "umd", or "script") and appends main() invocation and exports.
+fn wrapModuleFormat(t: *Transpiler, bodyJS: string, includeMainCall: bool) -> string {
+    fmtName := t.cfg.format
+    sb := str.NewBuilder(str.Len(bodyJS) + 1024)
+
+    // Deduplicate exported symbol pairs
+    var expSpecs []string
+    var cjsPairs []string
+    seen := make(map[string]bool)
+    for i := 0; i < len(t.exportedSymbols); i = i + 1 {
+        pubName := SanitizeJSIdent(t.exportedSymbols[i])
+        jsName := t.exportedJSNames[i]
+        if !seen[pubName] {
+            seen[pubName] = true
+            if str.Equal(pubName, jsName) {
+                expSpecs = append(expSpecs, jsName)
+                cjsPairs = append(cjsPairs, jsName)
+            } else {
+                expSpecs = append(expSpecs, str.Concat(jsName, str.Concat(" as ", pubName)))
+                cjsPairs = append(cjsPairs, str.Concat(pubName, str.Concat(": ", jsName)))
+            }
+        }
+    }
+
+    if str.Equal(fmtName, "iife") {
+        str.Write(&sb, "(function(__global) {\n")
+        if t.cfg.strict {
+            str.Write(&sb, "\"use strict\";\n")
+        }
+        str.Write(&sb, bodyJS)
+        if includeMainCall && t.cfg.autoRunMain && t.hasMainFn {
+            str.Write(&sb, "\nif (typeof main === \"function\") { main(); }\n")
+        }
+        if len(cjsPairs) > 0 && str.Len(t.cfg.globalName) > 0 {
+            str.Write(&sb, str.Concat("__global[", str.Concat(escapeJSString(t.cfg.globalName), str.Concat("] = { ", str.Concat(str.Join(cjsPairs, ", "), " };\n")))))
+        }
+        str.Write(&sb, "})(typeof globalThis !== \"undefined\" ? globalThis : (typeof window !== \"undefined\" ? window : this));\n")
+        res := str.String(sb)
+        str.Free(&sb)
+        return res
+    }
+
+    if str.Equal(fmtName, "umd") {
+        gName := "SkinkApp"
+        if str.Len(t.cfg.globalName) > 0 {
+            gName = t.cfg.globalName
+        }
+        str.Write(&sb, str.Concat("(function(root, factory) {\n  if (typeof define === \"function\" && define.amd) {\n    define([], factory);\n  } else if (typeof module === \"object\" && module.exports) {\n    module.exports = factory();\n  } else {\n    root[", str.Concat(escapeJSString(gName), "] = factory();\n  }\n})(typeof globalThis !== \"undefined\" ? globalThis : this, function() {\n")))
+        if t.cfg.strict {
+            str.Write(&sb, "\"use strict\";\n")
+        }
+        str.Write(&sb, bodyJS)
+        if includeMainCall && t.cfg.autoRunMain && t.hasMainFn {
+            str.Write(&sb, "\nif (typeof main === \"function\") { main(); }\n")
+        }
+        str.Write(&sb, str.Concat("return { ", str.Concat(str.Join(cjsPairs, ", "), " };\n});\n")))
+        res := str.String(sb)
+        str.Free(&sb)
+        return res
+    }
+
+    if str.Equal(fmtName, "cjs") {
+        if t.cfg.strict {
+            str.Write(&sb, "\"use strict\";\n\n")
+        }
+        str.Write(&sb, bodyJS)
+        if includeMainCall && t.cfg.autoRunMain && t.hasMainFn {
+            str.Write(&sb, "\nif (typeof main === \"function\") { main(); }\n")
+        }
+        if len(cjsPairs) > 0 {
+            str.Write(&sb, str.Concat("\nif (typeof module !== \"undefined\" && module.exports) {\n  module.exports = { ", str.Concat(str.Join(cjsPairs, ", "), " };\n}\n")))
+        }
+        res := str.String(sb)
+        str.Free(&sb)
+        return res
+    }
+
+    if str.Equal(fmtName, "script") {
+        if t.cfg.strict {
+            str.Write(&sb, "\"use strict\";\n\n")
+        }
+        str.Write(&sb, bodyJS)
+        if includeMainCall && t.cfg.autoRunMain && t.hasMainFn {
+            str.Write(&sb, "\nif (typeof main === \"function\") { main(); }\n")
+        }
+        res := str.String(sb)
+        str.Free(&sb)
+        return res
+    }
+
+    // Default: "esm" (ECMAScript module)
+    str.Write(&sb, bodyJS)
+    if includeMainCall && t.cfg.autoRunMain && t.hasMainFn {
+        str.Write(&sb, "\nif (typeof main === \"function\") { main(); }\n")
+    }
+    if len(expSpecs) > 0 {
+        str.Write(&sb, str.Concat("\nexport { ", str.Concat(str.Join(expSpecs, ", "), " };\n")))
+    }
+    res := str.String(sb)
+    str.Free(&sb)
+    return res
+}
+
+// countLines returns the number of lines in text.
+fn countLines(text: string) -> int {
+    n := str.Len(text)
+    if n == 0 {
+        return 1
+    }
+    lines := 1
+    for i := 0; i < n; i = i + 1 {
+        if int(text[i]) == 10 {
+            lines = lines + 1
+        }
+    }
+    return lines
+}
+
+// finalizeOutputUnit applies optional minification and attaches source map metadata.
+fn finalizeOutputUnit(t: *Transpiler, outPath: string, rawJS: string) -> OutputUnit {
+    finalJS := rawJS
+    if t.cfg.minify {
+        finalJS = minify.MinifyJS(finalJS)
+        if !str.EndsWith(finalJS, "\n") {
+            finalJS = str.Concat(finalJS, "\n")
+        }
+    }
+
+    mapPath := ""
+    mapJSON := ""
+    if t.cfg.sourceMap {
+        totalLines := countLines(finalJS)
+        mapJSON = sourcemap.BuildJSON(t.sm, totalLines, t.cfg.includeSources)
+        if t.cfg.inlineSourceMap {
+            inlineComment := sourcemap.BuildInlineComment(mapJSON)
+            finalJS = str.Concat(finalJS, str.Concat("\n", str.Concat(inlineComment, "\n")))
+        } else {
+            mapPath = str.Concat(outPath, ".map")
+            mapBase := path.Base(mapPath)
+            finalJS = str.Concat(finalJS, str.Concat("\n//# sourceMappingURL=", str.Concat(mapBase, "\n")))
+        }
+    }
+
+    return OutputUnit{
+        filePath:      outPath,
+        jsCode:        finalJS,
+        sourceMapPath: mapPath,
+        sourceMapJSON: mapJSON
+    }
+}
+
+// groupByModules partitions the flat resolved declaration list into per-module groups
+// for multi-file output mode.
+fn groupByModules(decls: []ast.Stmt) -> []ModuleGroup {
+    var groups []ModuleGroup
+    modIndex := make(map[string]int)
+
+    curMod := "main"
+    curFile := ""
+    for i := 0; i < len(decls); i = i + 1 {
+        stmt := decls[i]
+        if stmt.kind == ast.ST_MODULE {
+            curMod = stmt.decl.moduleName
+            if str.Len(curMod) == 0 {
+                curMod = "main"
+            }
+            curFile = stmt.filePath
+            if !runtime.IsRuntimeBackedStdModule(curMod) {
+                existingIdx := modIndex[curMod]
+                if existingIdx == 0 {
+                    var emptyDecls []ast.Stmt
+                    var emptyImps []string
+                    g := ModuleGroup{
+                        name:          curMod,
+                        filePath:      curFile,
+                        decls:         emptyDecls,
+                        imports:       emptyImps,
+                        importAliases: make(map[string]string)
+                    }
+                    groups = append(groups, g)
+                    modIndex[curMod] = len(groups)
+                }
+            }
+            continue
+        }
+        if runtime.IsRuntimeBackedStdModule(curMod) {
+            continue
+        }
+        idx1 := modIndex[curMod]
+        if idx1 == 0 {
+            var emptyDecls []ast.Stmt
+            var emptyImps []string
+            g := ModuleGroup{
+                name:          curMod,
+                filePath:      stmt.filePath,
+                decls:         emptyDecls,
+                imports:       emptyImps,
+                importAliases: make(map[string]string)
+            }
+            groups = append(groups, g)
+            idx1 = len(groups)
+            modIndex[curMod] = idx1
+        }
+        gIdx := idx1 - 1
+        groups[gIdx].decls = append(groups[gIdx].decls, stmt)
+        if stmt.kind == ast.ST_IMPORT {
+            impPath := stmt.decl.importPath
+            shortMod := path.Base(impPath)
+            atIdx := str.IndexOf(shortMod, "@")
+            if atIdx >= 0 {
+                shortMod = str.Substr(shortMod, 0, atIdx)
+            }
+            if !runtime.IsRuntimeBackedStdModule(shortMod) {
+                already := false
+                for k := 0; k < len(groups[gIdx].imports); k = k + 1 {
+                    if str.Equal(groups[gIdx].imports[k], shortMod) {
+                        already = true
+                    }
+                }
+                if !already {
+                    groups[gIdx].imports = append(groups[gIdx].imports, shortMod)
+                }
+                alias := stmt.decl.importAlias
+                if str.Len(alias) == 0 {
+                    alias = shortMod
+                }
+                groups[gIdx].importAliases[alias] = shortMod
+            }
+        }
+    }
+    return groups
+}
+
+// buildRuntimeModuleUnit creates the shared `_skink_runtime.js` output unit for multi-file mode.
+fn buildRuntimeModuleUnit(cfg: config.Config, outDir: string) -> OutputUnit {
+    rtPath := "_skink_runtime.js"
+    if str.Len(outDir) > 0 {
+        if str.EndsWith(outDir, "/") {
+            rtPath = str.Concat(outDir, "_skink_runtime.js")
+        } else {
+            rtPath = str.Concat(outDir, "/_skink_runtime.js")
+        }
+    }
+    prelude := runtime.EmitRuntimePrelude()
+    exportedNames := "__skink, str_Len, str_Compare, str_Equal, str_Contains, str_Concat, str_Substr, str_Trim, str_StartsWith, str_EndsWith, str_IndexOf, str_LastIndexOf, str_Split, str_Join, str_Replace, str_ToLower, str_ToUpper, str_Repeat, str_NewBuilder, str_Write, str_WriteByte, str_String, str_BuilderValue, str_LenBuilder, str_Reset, str_Free, buf_NewBuffer, fmt_Itoa, fmt_Ftoa, fmt_Btoa, fmt_Sprintf1s, fmt_Sprintf1d, fmt_Sprintf1f, fmt_Sprintf2s, strconv_Itoa, strconv_Atoi, strconv_ParseInt, strconv_ParseInt64, strconv_ParseFloat, strconv_ParseBool, strconv_FormatInt, strconv_FormatFloat, strconv_FormatBool, math_Pi, math_E, math_Sqrt2, math_Ln2, math_Ln10, math_Sqrt, math_Sin, math_Cos, math_Tan, math_Asin, math_Acos, math_Atan, math_Atan2, math_Sinh, math_Cosh, math_Tanh, math_Pow, math_Exp, math_Log, math_Log10, math_Ceil, math_Floor, math_Round, math_Abs, math_Min, math_Max, math_Clamp, errors_New, errors_None, errors_Is, errors_Wrap, path_Join, path_Base, path_Dir, path_Ext, path_IsAbs, json_Null, json_FromBool, json_FromNumber, json_FromString, json_FromArray, json_FromObject, json_IsNull, json_AsBool, json_AsNumber, json_AsString, json_ArrayLen, json_ArrayGet, json_ObjectLen, json_ObjectGet, json_GetString, json_GetNumber, json_GetInt, json_GetBool, json_GetObject, json_GetArray, json_MarshalValue, json_Marshal, json_Unmarshal, time_Nanosecond, time_Microsecond, time_Millisecond, time_Second, time_Minute, time_Hour, time_NowUnix, time_NowMillis, time_NowNanos, time_SleepMillis, rand_Intn, rand_Float64, rand_IntRange, sort_Ints, sort_Floats, sort_Strings, regex_Compile, regex_MustCompile, regex_Match, base64_Encode, base64_Decode, os_Getenv, os_Setenv, os_Args, os_ArgsCount, os_Getwd, os_Exit, fs_Exists, fs_ReadAll, fs_WriteAll, fs_ReadFile, fs_WriteFile, testing_Reset, testing_Failed, testing_Errorf, testing_AssertTrue, testing_AssertFalse, testing_AssertEqualInt, testing_AssertEqualString, js_Global, js_Window, js_Document, js_Null, js_Undefined, js_FromInt, js_FromFloat, js_FromString, js_FromBool, js_NewObject, js_NewArray, js_New, js_Eval, js_ParseJSON, js_StringifyJSON, js_Log, js_Warn, js_Error, dom_GetElementById, dom_Query, dom_QueryAll, dom_Body, dom_Head, dom_DocumentElement, dom_CreateElement, dom_CreateElementWithText, dom_CreateElementWithClass, dom_Title, dom_SetTitle, dom_OnReady, dom_OnWindowEvent, dom_WindowWidth, dom_WindowHeight, dom_ScrollTo, dom_SetTimeout, dom_ClearTimeout, dom_SetInterval, dom_ClearInterval, dom_RequestAnimationFrame, dom_CancelAnimationFrame, dom_Alert, dom_Confirm, dom_Prompt, dom_Href, dom_SetHref, dom_Pathname, dom_Search, dom_Hash, dom_SetHash, dom_Reload, dom_PushState, dom_ReplaceState, dom_OnPopState, dom_LocalStorageGet, dom_LocalStorageSet, dom_LocalStorageRemove, dom_LocalStorageClear, dom_SessionStorageGet, dom_SessionStorageSet, dom_SessionStorageRemove, dom_FetchText, dom_FetchJSON, dom_ConnectWebSocket, dom_GetCanvas2D"
+
+    code := prelude
+    if str.Equal(cfg.format, "cjs") {
+        code = str.Concat("\"use strict\";\n", str.Concat(prelude, str.Concat("\nmodule.exports = { ", str.Concat(exportedNames, " };\n"))))
+    } else {
+        code = str.Concat(prelude, str.Concat("\nexport { ", str.Concat(exportedNames, " };\n")))
+    }
+    if cfg.minify {
+        code = str.Concat(minify.MinifyJS(code), "\n")
+    }
+    return OutputUnit{
+        filePath:      rtPath,
+        jsCode:        code,
+        sourceMapPath: "",
+        sourceMapJSON: ""
+    }
+}
+
+// TranspileProgram resolves, type-checks (when enabled), and transpiles the Skink
+// program at cfg.entry into one or more JavaScript OutputUnits.
+pub fn TranspileProgram(cfg: config.Config, skinkHome: string) -> (TranspileResult, []string) {
+    var emptyUnits []OutputUnit
+    var emptyErrs []string
+    res := TranspileResult{units: emptyUnits, entryModule: "main", hasMain: false}
+
+    if str.Len(cfg.entry) == 0 {
+        emptyErrs = append(emptyErrs, "missing input .skink file")
+        return res, emptyErrs
+    }
+
+    decls, resolveErrs := resolver.Resolve(cfg.entry, skinkHome)
+    if len(resolveErrs) > 0 {
+        return res, resolveErrs
+    }
+
+    if cfg.checkType {
+        c := checker.newChecker()
+        ok := checker.checkProgram(&c, decls)
+        if !ok {
+            return res, checker.Errors(&c)
+        }
+    }
+
+    // Single-file bundle mode
+    if cfg.bundle {
+        outPath := config.ResolveOutputPath(cfg)
+        t := newTranspiler(cfg, outPath)
+        registerDeclarations(&t, decls)
+
+        if cfg.includeRuntime {
+            writeRaw(&t, runtime.EmitRuntimePrelude())
+            writeRaw(&t, "\n")
+        }
+
+        for i := 0; i < len(decls); i = i + 1 {
+            emitTopLevelDecl(&t, decls[i])
+        }
+
+        rawBody := str.String(t.out)
+        str.Free(&t.out)
+        wrapped := wrapModuleFormat(&t, rawBody, true)
+        unit := finalizeOutputUnit(&t, outPath, wrapped)
+        res.units = append(res.units, unit)
+        res.hasMain = t.hasMainFn
+        return res, emptyErrs
+    }
+
+    // Multi-file output mode: emit `_skink_runtime.js` + one `.js` file per user module
+    outDir := cfg.outDir
+    if str.Len(outDir) == 0 && str.Len(cfg.outFile) > 0 {
+        dirPart := path.Dir(cfg.outFile)
+        if !str.Equal(dirPart, ".") {
+            outDir = dirPart
+        }
+    }
+
+    if cfg.includeRuntime {
+        rtUnit := buildRuntimeModuleUnit(cfg, outDir)
+        res.units = append(res.units, rtUnit)
+    }
+
+    groups := groupByModules(decls)
+    for gIdx := 0; gIdx < len(groups); gIdx = gIdx + 1 {
+        grp := groups[gIdx]
+        isEntry := gIdx == len(groups) - 1
+        stem := grp.name
+        if isEntry && str.Len(cfg.outFile) > 0 {
+            stem = config.StripSkinkExt(path.Base(cfg.outFile))
+        } else if str.Equal(stem, "main") {
+            stem = config.StripSkinkExt(path.Base(cfg.entry))
+        }
+        modFileName := str.Concat(stem, ".js")
+        modOutPath := modFileName
+        if str.Len(outDir) > 0 {
+            if str.EndsWith(outDir, "/") {
+                modOutPath = str.Concat(outDir, modFileName)
+            } else {
+                modOutPath = str.Concat(outDir, str.Concat("/", modFileName))
+            }
+        }
+
+        t := newTranspiler(cfg, modOutPath)
+        registerDeclarations(&t, decls)
+        t.currentModule = grp.name
+        setCurrentSourceFile(&t, grp.filePath)
+
+        // Emit runtime import and sibling module imports at top of file
+        rtExports := "__skink, str_Len, str_Compare, str_Equal, str_Contains, str_Concat, str_Substr, str_Trim, str_StartsWith, str_EndsWith, str_IndexOf, str_LastIndexOf, str_Split, str_Join, str_Replace, str_ToLower, str_ToUpper, str_Repeat, str_NewBuilder, str_Write, str_WriteByte, str_String, str_BuilderValue, str_LenBuilder, str_Reset, str_Free, buf_NewBuffer, fmt_Itoa, fmt_Ftoa, fmt_Btoa, fmt_Sprintf1s, fmt_Sprintf1d, fmt_Sprintf1f, fmt_Sprintf2s, strconv_Itoa, strconv_Atoi, strconv_ParseInt, strconv_ParseInt64, strconv_ParseFloat, strconv_ParseBool, strconv_FormatInt, strconv_FormatFloat, strconv_FormatBool, math_Pi, math_E, math_Sqrt2, math_Ln2, math_Ln10, math_Sqrt, math_Sin, math_Cos, math_Tan, math_Asin, math_Acos, math_Atan, math_Atan2, math_Sinh, math_Cosh, math_Tanh, math_Pow, math_Exp, math_Log, math_Log10, math_Ceil, math_Floor, math_Round, math_Abs, math_Min, math_Max, math_Clamp, errors_New, errors_None, errors_Is, errors_Wrap, path_Join, path_Base, path_Dir, path_Ext, path_IsAbs, json_Null, json_FromBool, json_FromNumber, json_FromString, json_FromArray, json_FromObject, json_IsNull, json_AsBool, json_AsNumber, json_AsString, json_ArrayLen, json_ArrayGet, json_ObjectLen, json_ObjectGet, json_GetString, json_GetNumber, json_GetInt, json_GetBool, json_GetObject, json_GetArray, json_MarshalValue, json_Marshal, json_Unmarshal, time_Nanosecond, time_Microsecond, time_Millisecond, time_Second, time_Minute, time_Hour, time_NowUnix, time_NowMillis, time_NowNanos, time_SleepMillis, rand_Intn, rand_Float64, rand_IntRange, sort_Ints, sort_Floats, sort_Strings, regex_Compile, regex_MustCompile, regex_Match, base64_Encode, base64_Decode, os_Getenv, os_Setenv, os_Args, os_ArgsCount, os_Getwd, os_Exit, fs_Exists, fs_ReadAll, fs_WriteAll, fs_ReadFile, fs_WriteFile, testing_Reset, testing_Failed, testing_Errorf, testing_AssertTrue, testing_AssertFalse, testing_AssertEqualInt, testing_AssertEqualString, js_Global, js_Window, js_Document, js_Null, js_Undefined, js_FromInt, js_FromFloat, js_FromString, js_FromBool, js_NewObject, js_NewArray, js_New, js_Eval, js_ParseJSON, js_StringifyJSON, js_Log, js_Warn, js_Error, dom_GetElementById, dom_Query, dom_QueryAll, dom_Body, dom_Head, dom_DocumentElement, dom_CreateElement, dom_CreateElementWithText, dom_CreateElementWithClass, dom_Title, dom_SetTitle, dom_OnReady, dom_OnWindowEvent, dom_WindowWidth, dom_WindowHeight, dom_ScrollTo, dom_SetTimeout, dom_ClearTimeout, dom_SetInterval, dom_ClearInterval, dom_RequestAnimationFrame, dom_CancelAnimationFrame, dom_Alert, dom_Confirm, dom_Prompt, dom_Href, dom_SetHref, dom_Pathname, dom_Search, dom_Hash, dom_SetHash, dom_Reload, dom_PushState, dom_ReplaceState, dom_OnPopState, dom_LocalStorageGet, dom_LocalStorageSet, dom_LocalStorageRemove, dom_LocalStorageClear, dom_SessionStorageGet, dom_SessionStorageSet, dom_SessionStorageRemove, dom_FetchText, dom_FetchJSON, dom_ConnectWebSocket, dom_GetCanvas2D"
+        if cfg.includeRuntime {
+            if str.Equal(cfg.format, "cjs") {
+                emitLine(&t, str.Concat("const { ", str.Concat(rtExports, " } = require(\"./_skink_runtime.js\");")))
+            } else {
+                emitLine(&t, str.Concat("import { ", str.Concat(rtExports, " } from \"./_skink_runtime.js\";")))
+            }
+        }
+        for impIdx := 0; impIdx < len(grp.imports); impIdx = impIdx + 1 {
+            impMod := grp.imports[impIdx]
+            if str.Equal(cfg.format, "cjs") {
+                emitLine(&t, str.Concat("const ", str.Concat(SanitizeJSIdent(impMod), str.Concat(" = require(\"./", str.Concat(impMod, ".js\");")))))
+            } else {
+                emitLine(&t, str.Concat("import * as ", str.Concat(SanitizeJSIdent(impMod), str.Concat(" from \"./", str.Concat(impMod, ".js\";")))))
+            }
+        }
+        writeRaw(&t, "\n")
+
+        for dIdx := 0; dIdx < len(grp.decls); dIdx = dIdx + 1 {
+            emitTopLevelDecl(&t, grp.decls[dIdx])
+        }
+
+        rawBody := str.String(t.out)
+        str.Free(&t.out)
+        wrapped := wrapModuleFormat(&t, rawBody, isEntry)
+        unit := finalizeOutputUnit(&t, modOutPath, wrapped)
+        res.units = append(res.units, unit)
+        if t.hasMainFn {
+            res.hasMain = true
+        }
+    }
+
+    return res, emptyErrs
+}

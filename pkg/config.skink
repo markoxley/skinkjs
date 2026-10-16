@@ -1,0 +1,759 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: skinkjs — Skink to ECMAScript/JavaScript Transpiler
+//
+// File:    pkg/config.skink
+// Purpose: JSON configuration schema (skinkjs.json), validation, normalization,
+//          and command-line parameter overrides for the skinkjs transpiler.
+// Author:  Mark Oxley
+// Created: 2026
+
+module config
+
+import "std/str"
+import "std/fs"
+import "std/path"
+import "std/json"
+import "std/errors"
+
+// Config holds all configuration options controlling Skink-to-JavaScript transpilation.
+// Values can be loaded from a JSON configuration file (e.g. skinkjs.json) and
+// overridden individually via command-line parameters.
+pub struct Config {
+    entry:           string // Input .skink entry file path
+    configPath:      string // Path to the JSON configuration file if loaded
+    format:          string // Output module format: "esm", "cjs", "iife", "umd", "script"
+    target:          string // ECMAScript target: "es2022", "es2020", "es2015", "esnext"
+    env:             string // Target runtime environment: "universal", "node", "browser"
+    outFile:         string // Explicit output file name (empty = derived from entry)
+    outDir:          string // Output directory for single or multi-file output
+    bundle:          bool   // true = single-file bundle output, false = multi-file module output
+    minify:          bool   // true = minify emitted JavaScript
+    sourceMap:       bool   // true = emit a V3 .js.map source map file
+    inlineSourceMap: bool   // true = embed Base64 source map inline in the emitted .js file
+    includeSources:  bool   // true = embed original .skink source text in sourcesContent
+    globalName:      string // Global namespace identifier for "iife" and "umd" formats
+    autoRunMain:     bool   // true = invoke main() automatically when present
+    includeRuntime:  bool   // true = emit the __skink runtime prelude and stdlib shims
+    strict:          bool   // true = emit "use strict" directive where appropriate
+    keepComments:    bool   // true = emit declaration and origin comments in output
+    checkType:       bool   // true = run the Skink type-checker before transpiling
+    emitStdout:      bool   // true = write transpiled output to stdout instead of disk
+    showHelp:        bool   // true = print CLI usage and exit
+    showVersion:     bool   // true = print skinkjs version and exit
+    initConfig:      bool   // true = write a default skinkjs.json in current directory
+}
+
+// DefaultConfig returns a Config initialized with standard defaults.
+pub fn DefaultConfig() -> Config {
+    return Config{
+        entry:           "",
+        configPath:      "",
+        format:          "esm",
+        target:          "es2022",
+        env:             "universal",
+        outFile:         "",
+        outDir:          "",
+        bundle:          true,
+        minify:          false,
+        sourceMap:       false,
+        inlineSourceMap: false,
+        includeSources:  true,
+        globalName:      "SkinkApp",
+        autoRunMain:     true,
+        includeRuntime:  true,
+        strict:          true,
+        keepComments:    false,
+        checkType:       true,
+        emitStdout:      false,
+        showHelp:        false,
+        showVersion:     false,
+        initConfig:      false
+    }
+}
+
+// NormalizeFormat validates and normalizes an output format string.
+// Supported canonical formats are "esm", "cjs", "iife", "umd", and "script".
+pub fn NormalizeFormat(raw: string) -> (string, bool) {
+    s := str.ToLower(str.Trim(raw))
+    if str.Equal(s, "esm") || str.Equal(s, "es") || str.Equal(s, "es6") || str.Equal(s, "ecmascript") || str.Equal(s, "module") {
+        return "esm", true
+    }
+    if str.Equal(s, "cjs") || str.Equal(s, "commonjs") || str.Equal(s, "node") {
+        return "cjs", true
+    }
+    if str.Equal(s, "iife") || str.Equal(s, "browser") {
+        return "iife", true
+    }
+    if str.Equal(s, "umd") {
+        return "umd", true
+    }
+    if str.Equal(s, "script") || str.Equal(s, "plain") || str.Equal(s, "raw") {
+        return "script", true
+    }
+    return "", false
+}
+
+// NormalizeTarget validates and normalizes an ECMAScript language target string.
+pub fn NormalizeTarget(raw: string) -> (string, bool) {
+    s := str.ToLower(str.Trim(raw))
+    if str.Equal(s, "es6") || str.Equal(s, "es2015") {
+        return "es2015", true
+    }
+    if str.Equal(s, "es2016") || str.Equal(s, "es2017") || str.Equal(s, "es2018") || str.Equal(s, "es2019") || str.Equal(s, "es2020") {
+        return "es2020", true
+    }
+    if str.Equal(s, "es2021") || str.Equal(s, "es2022") || str.Equal(s, "es2023") || str.Equal(s, "es2024") {
+        return "es2022", true
+    }
+    if str.Equal(s, "esnext") || str.Equal(s, "latest") {
+        return "esnext", true
+    }
+    return "", false
+}
+
+// NormalizeEnv validates and normalizes a JavaScript runtime environment name.
+pub fn NormalizeEnv(raw: string) -> (string, bool) {
+    s := str.ToLower(str.Trim(raw))
+    if str.Equal(s, "universal") || str.Equal(s, "any") || str.Equal(s, "isomorphic") || str.Equal(s, "all") {
+        return "universal", true
+    }
+    if str.Equal(s, "node") || str.Equal(s, "nodejs") {
+        return "node", true
+    }
+    if str.Equal(s, "browser") || str.Equal(s, "web") {
+        return "browser", true
+    }
+    return "", false
+}
+
+// hasKey checks whether a JSON object Value explicitly defines key.
+fn hasKey(obj: json.Value, key: string) -> bool {
+    for i := 0; i < len(obj.objKeys); i = i + 1 {
+        if str.Equal(obj.objKeys[i], key) {
+            return true
+        }
+    }
+    return false
+}
+
+// ApplyJSONString parses a JSON configuration string and merges all present
+// properties into cfg. Returns an error on malformed JSON or invalid option values.
+pub fn ApplyJSONString(cfg: *Config, jsonSrc: string) -> errors.Error {
+    trimmed := str.Trim(jsonSrc)
+    if str.Len(trimmed) == 0 {
+        return errors.New("empty JSON configuration")
+    }
+    root, err := json.Unmarshal(trimmed)
+    if err.message != "" {
+        return errors.Wrap(err, "invalid JSON configuration")
+    }
+    if root.kind != 5 {
+        return errors.New("JSON configuration root must be an object")
+    }
+
+    // Entry file
+    if hasKey(root, "entry") {
+        cfg.entry = json.GetString(root, "entry")
+    } else if hasKey(root, "input") {
+        cfg.entry = json.GetString(root, "input")
+    } else if hasKey(root, "file") {
+        cfg.entry = json.GetString(root, "file")
+    }
+
+    // Output format
+    if hasKey(root, "format") || hasKey(root, "outputFormat") || hasKey(root, "module") {
+        rawFmt := ""
+        if hasKey(root, "format") {
+            rawFmt = json.GetString(root, "format")
+        } else if hasKey(root, "outputFormat") {
+            rawFmt = json.GetString(root, "outputFormat")
+        } else {
+            rawFmt = json.GetString(root, "module")
+        }
+        normFmt, ok := NormalizeFormat(rawFmt)
+        if !ok {
+            return errors.New(str.Concat("unsupported output format in JSON config: ", rawFmt))
+        }
+        cfg.format = normFmt
+    }
+
+    // ECMAScript target
+    if hasKey(root, "target") {
+        rawTarget := json.GetString(root, "target")
+        normTarget, ok := NormalizeTarget(rawTarget)
+        if !ok {
+            return errors.New(str.Concat("unsupported target in JSON config: ", rawTarget))
+        }
+        cfg.target = normTarget
+    }
+
+    // Environment
+    if hasKey(root, "env") || hasKey(root, "environment") || hasKey(root, "platform") {
+        rawEnv := ""
+        if hasKey(root, "env") {
+            rawEnv = json.GetString(root, "env")
+        } else if hasKey(root, "environment") {
+            rawEnv = json.GetString(root, "environment")
+        } else {
+            rawEnv = json.GetString(root, "platform")
+        }
+        normEnv, ok := NormalizeEnv(rawEnv)
+        if !ok {
+            return errors.New(str.Concat("unsupported environment in JSON config: ", rawEnv))
+        }
+        cfg.env = normEnv
+    }
+
+    // Output file name
+    if hasKey(root, "outFile") {
+        cfg.outFile = json.GetString(root, "outFile")
+    } else if hasKey(root, "outputFile") {
+        cfg.outFile = json.GetString(root, "outputFile")
+    } else if hasKey(root, "output") {
+        cfg.outFile = json.GetString(root, "output")
+    }
+
+    // Output directory
+    if hasKey(root, "outDir") {
+        cfg.outDir = json.GetString(root, "outDir")
+    } else if hasKey(root, "outputDir") {
+        cfg.outDir = json.GetString(root, "outputDir")
+    } else if hasKey(root, "outputDirectory") {
+        cfg.outDir = json.GetString(root, "outputDirectory")
+    }
+
+    // Single-file vs Multi-file output
+    if hasKey(root, "bundle") {
+        cfg.bundle = json.GetBool(root, "bundle")
+    }
+    if hasKey(root, "singleFile") {
+        cfg.bundle = json.GetBool(root, "singleFile")
+    }
+    if hasKey(root, "multiFile") {
+        cfg.bundle = !json.GetBool(root, "multiFile")
+    }
+    if hasKey(root, "multipleFiles") {
+        cfg.bundle = !json.GetBool(root, "multipleFiles")
+    }
+
+    // Minification
+    if hasKey(root, "minify") {
+        cfg.minify = json.GetBool(root, "minify")
+    }
+
+    // Source maps
+    if hasKey(root, "sourceMap") {
+        cfg.sourceMap = json.GetBool(root, "sourceMap")
+    } else if hasKey(root, "sourcemap") {
+        cfg.sourceMap = json.GetBool(root, "sourcemap")
+    }
+    if hasKey(root, "inlineSourceMap") {
+        cfg.inlineSourceMap = json.GetBool(root, "inlineSourceMap")
+        if cfg.inlineSourceMap {
+            cfg.sourceMap = true
+        }
+    }
+    if hasKey(root, "includeSources") || hasKey(root, "sourcesContent") {
+        if hasKey(root, "includeSources") {
+            cfg.includeSources = json.GetBool(root, "includeSources")
+        } else {
+            cfg.includeSources = json.GetBool(root, "sourcesContent")
+        }
+    }
+
+    // Global name for IIFE / UMD
+    if hasKey(root, "globalName") {
+        gn := str.Trim(json.GetString(root, "globalName"))
+        if str.Len(gn) > 0 {
+            cfg.globalName = gn
+        }
+    }
+
+    // Runtime & execution options
+    if hasKey(root, "autoRunMain") {
+        cfg.autoRunMain = json.GetBool(root, "autoRunMain")
+    } else if hasKey(root, "runMain") {
+        cfg.autoRunMain = json.GetBool(root, "runMain")
+    }
+    if hasKey(root, "includeRuntime") {
+        cfg.includeRuntime = json.GetBool(root, "includeRuntime")
+    } else if hasKey(root, "runtime") {
+        cfg.includeRuntime = json.GetBool(root, "runtime")
+    }
+    if hasKey(root, "strict") {
+        cfg.strict = json.GetBool(root, "strict")
+    }
+    if hasKey(root, "keepComments") || hasKey(root, "comments") {
+        if hasKey(root, "keepComments") {
+            cfg.keepComments = json.GetBool(root, "keepComments")
+        } else {
+            cfg.keepComments = json.GetBool(root, "comments")
+        }
+    }
+    if hasKey(root, "checkType") || hasKey(root, "typeCheck") {
+        if hasKey(root, "checkType") {
+            cfg.checkType = json.GetBool(root, "checkType")
+        } else {
+            cfg.checkType = json.GetBool(root, "typeCheck")
+        }
+    }
+
+    return errors.None()
+}
+
+// LoadConfigFile reads a JSON configuration file from disk and applies it to cfg.
+pub fn LoadConfigFile(cfg: *Config, filePath: string) -> errors.Error {
+    if !fs.Exists(filePath) {
+        return errors.New(str.Concat("configuration file not found: ", filePath))
+    }
+    content, err := fs.ReadAll(filePath)
+    if err.message != "" {
+        return errors.Wrap(err, str.Concat("cannot read configuration file ", filePath))
+    }
+    cfg.configPath = filePath
+    return ApplyJSONString(cfg, content)
+}
+
+// ExtractConfigFlag scans CLI args for -c / --config <path> before full flag parsing
+// so that the specified JSON configuration is loaded first and subsequent CLI flags override it.
+pub fn ExtractConfigFlag(args: []string) -> (string, errors.Error) {
+    i := 0
+    for i < len(args) {
+        arg := args[i]
+        if str.Equal(arg, "-c") || str.Equal(arg, "--config") {
+            if i + 1 >= len(args) {
+                return "", errors.New("missing file path after --config / -c")
+            }
+            return args[i + 1], errors.None()
+        }
+        if str.StartsWith(arg, "--config=") {
+            return str.Substr(arg, 9, str.Len(arg) - 9), errors.None()
+        }
+        i = i + 1
+    }
+    return "", errors.None()
+}
+
+// ParseCLIOverrides parses command-line arguments and overrides fields on cfg.
+pub fn ParseCLIOverrides(cfg: *Config, args: []string) -> errors.Error {
+    i := 0
+    for i < len(args) {
+        arg := args[i]
+
+        if str.Equal(arg, "-h") || str.Equal(arg, "--help") || str.Equal(arg, "help") {
+            cfg.showHelp = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "-v") || str.Equal(arg, "--version") || str.Equal(arg, "-version") || str.Equal(arg, "version") {
+            cfg.showVersion = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "init") || str.Equal(arg, "--init") {
+            cfg.initConfig = true
+            i = i + 1
+            continue
+        }
+
+        // Config path (already handled in pre-pass, skip value here)
+        if str.Equal(arg, "-c") || str.Equal(arg, "--config") {
+            if i + 1 >= len(args) {
+                return errors.New("missing argument for --config")
+            }
+            i = i + 2
+            continue
+        }
+        if str.StartsWith(arg, "--config=") {
+            i = i + 1
+            continue
+        }
+
+        // Entry file via flag
+        if str.Equal(arg, "-i") || str.Equal(arg, "--input") || str.Equal(arg, "--entry") {
+            if i + 1 >= len(args) {
+                return errors.New(str.Concat("missing argument for ", arg))
+            }
+            cfg.entry = args[i + 1]
+            i = i + 2
+            continue
+        }
+        if str.StartsWith(arg, "--entry=") {
+            cfg.entry = str.Substr(arg, 8, str.Len(arg) - 8)
+            i = i + 1
+            continue
+        }
+        if str.StartsWith(arg, "--input=") {
+            cfg.entry = str.Substr(arg, 8, str.Len(arg) - 8)
+            i = i + 1
+            continue
+        }
+
+        // Output format
+        if str.Equal(arg, "-f") || str.Equal(arg, "--format") {
+            if i + 1 >= len(args) {
+                return errors.New("missing argument for --format")
+            }
+            normFmt, ok := NormalizeFormat(args[i + 1])
+            if !ok {
+                return errors.New(str.Concat("unsupported output format: ", args[i + 1]))
+            }
+            cfg.format = normFmt
+            i = i + 2
+            continue
+        }
+        if str.StartsWith(arg, "--format=") {
+            rawFmt := str.Substr(arg, 9, str.Len(arg) - 9)
+            normFmt, ok := NormalizeFormat(rawFmt)
+            if !ok {
+                return errors.New(str.Concat("unsupported output format: ", rawFmt))
+            }
+            cfg.format = normFmt
+            i = i + 1
+            continue
+        }
+
+        // Target ECMAScript version
+        if str.Equal(arg, "-t") || str.Equal(arg, "--target") {
+            if i + 1 >= len(args) {
+                return errors.New("missing argument for --target")
+            }
+            normTarget, ok := NormalizeTarget(args[i + 1])
+            if !ok {
+                return errors.New(str.Concat("unsupported target: ", args[i + 1]))
+            }
+            cfg.target = normTarget
+            i = i + 2
+            continue
+        }
+        if str.StartsWith(arg, "--target=") {
+            rawTarget := str.Substr(arg, 9, str.Len(arg) - 9)
+            normTarget, ok := NormalizeTarget(rawTarget)
+            if !ok {
+                return errors.New(str.Concat("unsupported target: ", rawTarget))
+            }
+            cfg.target = normTarget
+            i = i + 1
+            continue
+        }
+
+        // Runtime environment
+        if str.Equal(arg, "--env") || str.Equal(arg, "--platform") {
+            if i + 1 >= len(args) {
+                return errors.New(str.Concat("missing argument for ", arg))
+            }
+            normEnv, ok := NormalizeEnv(args[i + 1])
+            if !ok {
+                return errors.New(str.Concat("unsupported environment: ", args[i + 1]))
+            }
+            cfg.env = normEnv
+            i = i + 2
+            continue
+        }
+        if str.StartsWith(arg, "--env=") {
+            rawEnv := str.Substr(arg, 6, str.Len(arg) - 6)
+            normEnv, ok := NormalizeEnv(rawEnv)
+            if !ok {
+                return errors.New(str.Concat("unsupported environment: ", rawEnv))
+            }
+            cfg.env = normEnv
+            i = i + 1
+            continue
+        }
+
+        // Output file name
+        if str.Equal(arg, "-o") || str.Equal(arg, "--out-file") || str.Equal(arg, "--output") {
+            if i + 1 >= len(args) {
+                return errors.New(str.Concat("missing argument for ", arg))
+            }
+            cfg.outFile = args[i + 1]
+            if str.Equal(cfg.outFile, "-") {
+                cfg.emitStdout = true
+            }
+            i = i + 2
+            continue
+        }
+        if str.StartsWith(arg, "--out-file=") {
+            cfg.outFile = str.Substr(arg, 11, str.Len(arg) - 11)
+            i = i + 1
+            continue
+        }
+        if str.StartsWith(arg, "--output=") {
+            cfg.outFile = str.Substr(arg, 9, str.Len(arg) - 9)
+            i = i + 1
+            continue
+        }
+
+        // Output directory
+        if str.Equal(arg, "-d") || str.Equal(arg, "--out-dir") || str.Equal(arg, "--outdir") {
+            if i + 1 >= len(args) {
+                return errors.New(str.Concat("missing argument for ", arg))
+            }
+            cfg.outDir = args[i + 1]
+            i = i + 2
+            continue
+        }
+        if str.StartsWith(arg, "--out-dir=") {
+            cfg.outDir = str.Substr(arg, 10, str.Len(arg) - 10)
+            i = i + 1
+            continue
+        }
+        if str.StartsWith(arg, "--outdir=") {
+            cfg.outDir = str.Substr(arg, 9, str.Len(arg) - 9)
+            i = i + 1
+            continue
+        }
+
+        // Single-file vs Multi-file output
+        if str.Equal(arg, "--bundle") || str.Equal(arg, "--single-file") || str.Equal(arg, "-b") {
+            cfg.bundle = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--no-bundle") || str.Equal(arg, "--multi-file") || str.Equal(arg, "--multiple-files") || str.Equal(arg, "-M") {
+            cfg.bundle = false
+            i = i + 1
+            continue
+        }
+
+        // Minification
+        if str.Equal(arg, "-m") || str.Equal(arg, "--minify") {
+            cfg.minify = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--no-minify") {
+            cfg.minify = false
+            i = i + 1
+            continue
+        }
+
+        // Source maps
+        if str.Equal(arg, "-s") || str.Equal(arg, "--sourcemap") || str.Equal(arg, "--source-map") {
+            cfg.sourceMap = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--no-sourcemap") || str.Equal(arg, "--no-source-map") {
+            cfg.sourceMap = false
+            cfg.inlineSourceMap = false
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--inline-sourcemap") || str.Equal(arg, "--inline-source-map") {
+            cfg.sourceMap = true
+            cfg.inlineSourceMap = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--sources-content") {
+            cfg.includeSources = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--no-sources-content") {
+            cfg.includeSources = false
+            i = i + 1
+            continue
+        }
+
+        // Global name for IIFE/UMD
+        if str.Equal(arg, "--global-name") || str.Equal(arg, "-g") {
+            if i + 1 >= len(args) {
+                return errors.New("missing argument for --global-name")
+            }
+            cfg.globalName = args[i + 1]
+            i = i + 2
+            continue
+        }
+        if str.StartsWith(arg, "--global-name=") {
+            cfg.globalName = str.Substr(arg, 14, str.Len(arg) - 14)
+            i = i + 1
+            continue
+        }
+
+        // Runtime & execution options
+        if str.Equal(arg, "--run-main") {
+            cfg.autoRunMain = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--no-run-main") {
+            cfg.autoRunMain = false
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--runtime") {
+            cfg.includeRuntime = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--no-runtime") {
+            cfg.includeRuntime = false
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--strict") {
+            cfg.strict = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--no-strict") {
+            cfg.strict = false
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--comments") {
+            cfg.keepComments = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--no-comments") {
+            cfg.keepComments = false
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--typecheck") || str.Equal(arg, "--check") {
+            cfg.checkType = true
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--no-typecheck") || str.Equal(arg, "--no-check") {
+            cfg.checkType = false
+            i = i + 1
+            continue
+        }
+        if str.Equal(arg, "--stdout") || str.Equal(arg, "--print") {
+            cfg.emitStdout = true
+            i = i + 1
+            continue
+        }
+
+        if str.StartsWith(arg, "-") {
+            return errors.New(str.Concat("unknown flag: ", arg))
+        }
+
+        // Positional argument: entry .skink file
+        cfg.entry = arg
+        i = i + 1
+    }
+
+    return errors.None()
+}
+
+// LoadAndMerge loads any JSON configuration file (explicit via -c/--config or
+// implicit ./skinkjs.json in cwd) and then applies CLI flag overrides on top.
+pub fn LoadAndMerge(args: []string, cwd: string) -> (Config, errors.Error) {
+    cfg := DefaultConfig()
+
+    explicitCfgPath, flagErr := ExtractConfigFlag(args)
+    if flagErr.message != "" {
+        return cfg, flagErr
+    }
+
+    if str.Len(explicitCfgPath) > 0 {
+        loadErr := LoadConfigFile(&cfg, explicitCfgPath)
+        if loadErr.message != "" {
+            return cfg, loadErr
+        }
+    } else {
+        defaultCfgPath := "skinkjs.json"
+        if str.Len(cwd) > 0 && !str.Equal(cwd, ".") {
+            defaultCfgPath = str.Concat(cwd, "/skinkjs.json")
+        }
+        if fs.Exists(defaultCfgPath) {
+            loadErr := LoadConfigFile(&cfg, defaultCfgPath)
+            if loadErr.message != "" {
+                return cfg, loadErr
+            }
+        }
+    }
+
+    cliErr := ParseCLIOverrides(&cfg, args)
+    if cliErr.message != "" {
+        return cfg, cliErr
+    }
+
+    return cfg, errors.None()
+}
+
+// StripSkinkExt removes a trailing ".skink" extension from a file name if present.
+pub fn StripSkinkExt(name: string) -> string {
+    if str.EndsWith(name, ".skink") {
+        return str.Substr(name, 0, str.Len(name) - 6)
+    }
+    dot := str.LastIndexOf(name, ".")
+    if dot > 0 {
+        return str.Substr(name, 0, dot)
+    }
+    return name
+}
+
+// ResolveOutputPath determines the primary output .js file path for single-file
+// compilation based on cfg.outDir, cfg.outFile, and cfg.entry.
+pub fn ResolveOutputPath(cfg: Config) -> string {
+    fileName := cfg.outFile
+    if str.Len(fileName) == 0 {
+        base := path.Base(cfg.entry)
+        stem := StripSkinkExt(base)
+        if str.Len(stem) == 0 {
+            stem = "out"
+        }
+        fileName = str.Concat(stem, ".js")
+    }
+    if str.Len(cfg.outDir) == 0 {
+        return fileName
+    }
+    // If outFile already starts with outDir or is absolute, keep it as-is.
+    if str.StartsWith(fileName, "/") || str.StartsWith(fileName, str.Concat(cfg.outDir, "/")) {
+        return fileName
+    }
+    if str.EndsWith(cfg.outDir, "/") {
+        return str.Concat(cfg.outDir, fileName)
+    }
+    return str.Concat(cfg.outDir, str.Concat("/", fileName))
+}
+
+// boolStr converts a boolean to its JSON literal string.
+fn boolStr(b: bool) -> string {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+// DefaultConfigJSON generates a formatted default skinkjs.json configuration file.
+pub fn DefaultConfigJSON(cfg: Config) -> string {
+    b := str.NewBuilder(512)
+    entryVal := cfg.entry
+    if str.Len(entryVal) == 0 {
+        entryVal = "main.skink"
+    }
+    outDirVal := cfg.outDir
+    if str.Len(outDirVal) == 0 {
+        outDirVal = "dist"
+    }
+    str.Write(&b, "{\n")
+    str.Write(&b, str.Concat("  \"entry\": \"", str.Concat(entryVal, "\",\n")))
+    str.Write(&b, str.Concat("  \"format\": \"", str.Concat(cfg.format, "\",\n")))
+    str.Write(&b, str.Concat("  \"target\": \"", str.Concat(cfg.target, "\",\n")))
+    str.Write(&b, str.Concat("  \"env\": \"", str.Concat(cfg.env, "\",\n")))
+    str.Write(&b, str.Concat("  \"outFile\": \"", str.Concat(cfg.outFile, "\",\n")))
+    str.Write(&b, str.Concat("  \"outDir\": \"", str.Concat(outDirVal, "\",\n")))
+    str.Write(&b, str.Concat("  \"bundle\": ", str.Concat(boolStr(cfg.bundle), ",\n")))
+    str.Write(&b, str.Concat("  \"minify\": ", str.Concat(boolStr(cfg.minify), ",\n")))
+    str.Write(&b, str.Concat("  \"sourceMap\": ", str.Concat(boolStr(cfg.sourceMap), ",\n")))
+    str.Write(&b, str.Concat("  \"inlineSourceMap\": ", str.Concat(boolStr(cfg.inlineSourceMap), ",\n")))
+    str.Write(&b, str.Concat("  \"includeSources\": ", str.Concat(boolStr(cfg.includeSources), ",\n")))
+    str.Write(&b, str.Concat("  \"globalName\": \"", str.Concat(cfg.globalName, "\",\n")))
+    str.Write(&b, str.Concat("  \"autoRunMain\": ", str.Concat(boolStr(cfg.autoRunMain), ",\n")))
+    str.Write(&b, str.Concat("  \"includeRuntime\": ", str.Concat(boolStr(cfg.includeRuntime), ",\n")))
+    str.Write(&b, str.Concat("  \"strict\": ", str.Concat(boolStr(cfg.strict), ",\n")))
+    str.Write(&b, str.Concat("  \"keepComments\": ", str.Concat(boolStr(cfg.keepComments), ",\n")))
+    str.Write(&b, str.Concat("  \"checkType\": ", str.Concat(boolStr(cfg.checkType), "\n")))
+    str.Write(&b, "}\n")
+    res := str.String(b)
+    str.Free(&b)
+    return res
+}
