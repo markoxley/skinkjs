@@ -9,8 +9,8 @@
 
 SKINK_PREFIX ?= $(HOME)/.local/skink
 BINDIR       ?= $(SKINK_PREFIX)/bin
-SKINK        ?= $(abspath ../skink/skink)
-SKINK_HOME   ?= $(abspath ../skink/std)
+SKINK        ?= $(abspath ../../skink/skink)
+SKINK_HOME   ?= $(abspath ../../skink/std)
 
 SKINKJS_BIN  := skinkjs
 SKINKJS_MAIN := skinkjs.skink

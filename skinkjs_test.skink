@@ -29,6 +29,9 @@ fn resolveTestSkinkHome() -> string {
     if int64(envHome) != 0 && str.Len(envHome) > 0 {
         return envHome
     }
+    if fs.Exists("../../skink/std/str.skink") {
+        return "../../skink/std"
+    }
     if fs.Exists("../skink/std/str.skink") {
         return "../skink/std"
     }

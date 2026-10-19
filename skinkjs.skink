@@ -99,6 +99,9 @@ fn resolveSkinkHome() -> string {
             return localStd
         }
     }
+    if fs.Exists("../../skink/std/str.skink") {
+        return "../../skink/std"
+    }
     if fs.Exists("../skink/std/str.skink") {
         return "../skink/std"
     }
